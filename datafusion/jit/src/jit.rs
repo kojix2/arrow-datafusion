@@ -62,12 +62,12 @@ impl Default for JIT {
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
         flag_builder.set("is_pic", "false").unwrap();
         let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
-            panic!("host machine is not supported: {}", msg);
+            panic!("host machine is not supported: {msg}");
         });
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .unwrap_or_else(|msg| {
-                panic!("host machine is not supported: {}", msg);
+                panic!("host machine is not supported: {msg}");
             });
         let builder =
             JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
@@ -99,7 +99,7 @@ impl JIT {
         flag_builder.set("opt_level", "speed").unwrap();
         flag_builder.set("enable_simd", "true").unwrap();
         let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
-            panic!("host machine is not supported: {}", msg);
+            panic!("host machine is not supported: {msg}");
         });
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
@@ -129,17 +129,26 @@ impl JIT {
 
         // Next, declare the function to jit. Functions must be declared
         // before they can be called, or defined.
-        let id = self.module.declare_function(
-            &name,
-            Linkage::Export,
-            &self.ctx.func.signature,
-        )?;
+        let id = self
+            .module
+            .declare_function(&name, Linkage::Export, &self.ctx.func.signature)
+            .map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed in declare the function to jit: {e:?}"
+                ))
+            })?;
 
         // Define the function to jit. This finishes compilation, although
         // there may be outstanding relocations to perform. Currently, jit
         // cannot finish relocations until all functions to be called are
         // defined. For now, we'll just finalize the function below.
-        self.module.define_function(id, &mut self.ctx)?;
+        self.module
+            .define_function(id, &mut self.ctx)
+            .map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed in define the function to jit: {e:?}"
+                ))
+            })?;
 
         // Now that compilation is finished, we can clear out the context state.
         self.module.clear_context(&mut self.ctx);
@@ -205,8 +214,13 @@ impl JIT {
         builder.seal_block(entry_block);
 
         // Walk the AST and declare all variables.
-        let variables =
-            declare_variables(&mut builder, &params, &the_return, &stmts, entry_block);
+        let variables = declare_variables(
+            &mut builder,
+            &params,
+            the_return.as_ref(),
+            &stmts,
+            entry_block,
+        );
 
         // Now translate the statements of the function body.
         let mut trans = FunctionTranslator {
@@ -652,7 +666,7 @@ fn typed_zero(typ: JITType, builder: &mut FunctionBuilder) -> Value {
 fn declare_variables(
     builder: &mut FunctionBuilder,
     params: &[(String, JITType)],
-    the_return: &Option<(String, JITType)>,
+    the_return: Option<&(String, JITType)>,
     stmts: &[Stmt],
     entry_block: Block,
 ) -> HashMap<String, Variable> {

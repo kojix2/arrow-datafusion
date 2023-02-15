@@ -26,7 +26,7 @@ use arrow::{
 
 use datafusion_common::Result;
 use datafusion_common::ScalarValue;
-use datafusion_expr::{Accumulator, AggregateState};
+use datafusion_expr::Accumulator;
 
 use std::{any::Any, sync::Arc};
 
@@ -114,7 +114,7 @@ impl ApproxPercentileWithWeightAccumulator {
 }
 
 impl Accumulator for ApproxPercentileWithWeightAccumulator {
-    fn state(&self) -> Result<Vec<AggregateState>> {
+    fn state(&self) -> Result<Vec<ScalarValue>> {
         self.approx_percentile_cont_accumulator.state()
     }
 
@@ -126,8 +126,8 @@ impl Accumulator for ApproxPercentileWithWeightAccumulator {
             weights.len(),
             "invalid number of values in means and weights"
         );
-        let means_f64 = ApproxPercentileAccumulator::convert_to_ordered_float(means)?;
-        let weights_f64 = ApproxPercentileAccumulator::convert_to_ordered_float(weights)?;
+        let means_f64 = ApproxPercentileAccumulator::convert_to_float(means)?;
+        let weights_f64 = ApproxPercentileAccumulator::convert_to_float(weights)?;
         let mut digests: Vec<TDigest> = vec![];
         for (mean, weight) in means_f64.iter().zip(weights_f64.iter()) {
             digests.push(TDigest::new_with_centroid(
@@ -149,5 +149,11 @@ impl Accumulator for ApproxPercentileWithWeightAccumulator {
             .merge_batch(states)?;
 
         Ok(())
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self)
+            - std::mem::size_of_val(&self.approx_percentile_cont_accumulator)
+            + self.approx_percentile_cont_accumulator.size()
     }
 }

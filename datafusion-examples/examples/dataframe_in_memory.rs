@@ -37,8 +37,8 @@ async fn main() -> Result<()> {
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(StringArray::from_slice(&["a", "b", "c", "d"])),
-            Arc::new(Int32Array::from_slice(&[1, 10, 10, 100])),
+            Arc::new(StringArray::from_slice(["a", "b", "c", "d"])),
+            Arc::new(Int32Array::from_slice([1, 10, 10, 100])),
         ],
     )?;
 
@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
 
     // declare a table in memory. In spark API, this corresponds to createDataFrame(...).
     ctx.register_batch("t", batch)?;
-    let df = ctx.table("t")?;
+    let df = ctx.table("t").await?;
 
     // construct an expression corresponding to "SELECT a, b FROM t WHERE b = 10" in SQL
     let filter = col("b").eq(lit(10));

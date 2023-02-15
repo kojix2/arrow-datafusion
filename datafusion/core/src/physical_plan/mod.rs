@@ -27,7 +27,6 @@ use crate::error::Result;
 use crate::physical_plan::expressions::PhysicalSortExpr;
 
 use arrow::datatypes::SchemaRef;
-use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
 
 pub use datafusion_expr::Accumulator;
@@ -44,7 +43,7 @@ use std::task::{Context, Poll};
 use std::{any::Any, pin::Pin};
 
 /// Trait for types that stream [arrow::record_batch::RecordBatch]
-pub trait RecordBatchStream: Stream<Item = ArrowResult<RecordBatch>> {
+pub trait RecordBatchStream: Stream<Item = Result<RecordBatch>> {
     /// Returns the schema of this `RecordBatchStream`.
     ///
     /// Implementation of this trait should guarantee that all `RecordBatch`'s returned by this
@@ -76,7 +75,7 @@ impl RecordBatchStream for EmptyRecordBatchStream {
 }
 
 impl Stream for EmptyRecordBatchStream {
-    type Item = ArrowResult<RecordBatch>;
+    type Item = Result<RecordBatch>;
 
     fn poll_next(
         self: Pin<&mut Self>,
@@ -110,8 +109,15 @@ pub trait ExecutionPlan: Debug + Send + Sync {
     /// Specifies the output partitioning scheme of this plan
     fn output_partitioning(&self) -> Partitioning;
 
-    /// If the output of this operator is sorted, returns `Some(keys)`
-    /// with the description of how it was sorted.
+    /// Specifies whether this plan generates an infinite stream of records.
+    /// If the plan does not support pipelining, but it its input(s) are
+    /// infinite, returns an error to indicate this.
+    fn unbounded_output(&self, _children: &[bool]) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// If the output of this operator within each partition is sorted,
+    /// returns `Some(keys)` with the description of how it was sorted.
     ///
     /// For example, Sort, (obviously) produces sorted output as does
     /// SortPreservingMergeStream. Less obviously `Projection`
@@ -122,27 +128,21 @@ pub trait ExecutionPlan: Debug + Send + Sync {
     /// have any particular output order here
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]>;
 
-    /// Specifies the data distribution requirements of all the
-    /// children for this operator
-    fn required_child_distribution(&self) -> Distribution {
-        Distribution::UnspecifiedDistribution
+    /// Specifies the data distribution requirements for all the
+    /// children for this operator, By default it's [[Distribution::UnspecifiedDistribution]] for each child,
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::UnspecifiedDistribution; self.children().len()]
     }
 
-    /// Returns `true` if this operator relies on its inputs being
-    /// produced in a certain order (for example that they are sorted
-    /// a particular way) for correctness.
+    /// Specifies the ordering requirements for all of the children
+    /// For each child, it's the local ordering requirement within
+    /// each partition rather than the global ordering
     ///
-    /// If `true` is returned, DataFusion will not apply certain
-    /// optimizations which might reorder the inputs (such as
-    /// repartitioning to increase concurrency).
-    ///
-    /// The default implementation returns `true`
-    ///
-    /// WARNING: if you override this default and return `false`, your
-    /// operator can not rely on DataFusion preserving the input order
-    /// as it will likely not.
-    fn relies_on_input_order(&self) -> bool {
-        true
+    /// NOTE that checking `!is_empty()` does **not** check for a
+    /// required input ordering. Instead, the correct check is that at
+    /// least one entry must be `Some`
+    fn required_input_ordering(&self) -> Vec<Option<&[PhysicalSortExpr]>> {
+        vec![None; self.children().len()]
     }
 
     /// Returns `false` if this operator's implementation may reorder
@@ -161,8 +161,8 @@ pub trait ExecutionPlan: Debug + Send + Sync {
     /// WARNING: if you override this default, you *MUST* ensure that
     /// the operator's maintains the ordering invariant or else
     /// DataFusion may produce incorrect results.
-    fn maintains_input_order(&self) -> bool {
-        false
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![false; self.children().len()]
     }
 
     /// Returns `true` if this operator would benefit from
@@ -175,10 +175,15 @@ pub trait ExecutionPlan: Debug + Send + Sync {
     fn benefits_from_input_partitioning(&self) -> bool {
         // By default try to maximize parallelism with more CPUs if
         // possible
-        !matches!(
-            self.required_child_distribution(),
-            Distribution::SinglePartition
-        )
+        !self
+            .required_input_distribution()
+            .into_iter()
+            .any(|dist| matches!(dist, Distribution::SinglePartition))
+    }
+
+    /// Get the EquivalenceProperties within the plan
+    fn equivalence_properties(&self) -> EquivalenceProperties {
+        EquivalenceProperties::new(self.schema())
     }
 
     /// Get a list of child execution plans that provide the input for this plan. The returned list
@@ -228,6 +233,34 @@ pub trait ExecutionPlan: Debug + Send + Sync {
     fn statistics(&self) -> Statistics;
 }
 
+/// Indicate whether a data exchange is needed for the input of `plan`, which will be very helpful
+/// especially for the distributed engine to judge whether need to deal with shuffling.
+/// Currently there are 3 kinds of execution plan which needs data exchange
+///     1. RepartitionExec for changing the partition number between two operators
+///     2. CoalescePartitionsExec for collapsing all of the partitions into one without ordering guarantee
+///     3. SortPreservingMergeExec for collapsing all of the sorted partitions into one with ordering guarantee
+pub fn need_data_exchange(plan: Arc<dyn ExecutionPlan>) -> bool {
+    if let Some(repart) = plan.as_any().downcast_ref::<RepartitionExec>() {
+        !matches!(
+            repart.output_partitioning(),
+            Partitioning::RoundRobinBatch(_)
+        )
+    } else if let Some(coalesce) = plan.as_any().downcast_ref::<CoalescePartitionsExec>()
+    {
+        coalesce.input().output_partitioning().partition_count() > 1
+    } else if let Some(sort_preserving_merge) =
+        plan.as_any().downcast_ref::<SortPreservingMergeExec>()
+    {
+        sort_preserving_merge
+            .input()
+            .output_partitioning()
+            .partition_count()
+            > 1
+    } else {
+        false
+    }
+}
+
 /// Returns a copy of this plan if we change any child according to the pointer comparison.
 /// The size of `children` must be equal to the size of `ExecutionPlan::children()`.
 /// Allow the vtable address comparisons for ExecutionPlan Trait Objects，it is harmless even
@@ -237,14 +270,15 @@ pub fn with_new_children_if_necessary(
     plan: Arc<dyn ExecutionPlan>,
     children: Vec<Arc<dyn ExecutionPlan>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    if children.len() != plan.children().len() {
+    let old_children = plan.children();
+    if children.len() != old_children.len() {
         Err(DataFusionError::Internal(
             "Wrong number of children".to_string(),
         ))
     } else if children.is_empty()
         || children
             .iter()
-            .zip(plan.children().iter())
+            .zip(old_children.iter())
             .any(|(c1, c2)| !Arc::ptr_eq(c1, c2))
     {
         plan.with_new_children(children)
@@ -270,14 +304,11 @@ pub fn with_new_children_if_necessary(
 ///   let mut ctx = SessionContext::with_config(config);
 ///
 ///   // register the a table
-///   ctx.register_csv("example", "tests/example.csv", CsvReadOptions::new()).await.unwrap();
+///   ctx.register_csv("example", "tests/data/example.csv", CsvReadOptions::new()).await.unwrap();
 ///
 ///   // create a plan to run a SQL query
-///   let plan = ctx
-///      .create_logical_plan("SELECT a FROM example WHERE a < 5")
-///      .unwrap();
-///   let plan = ctx.optimize(&plan).unwrap();
-///   let physical_plan = ctx.create_physical_plan(&plan).await.unwrap();
+///   let dataframe = ctx.sql("SELECT a FROM example WHERE a < 5").await.unwrap();
+///   let physical_plan = dataframe.create_physical_plan().await.unwrap();
 ///
 ///   // Format using display string
 ///   let displayable_plan = displayable(physical_plan.as_ref());
@@ -288,10 +319,10 @@ pub fn with_new_children_if_necessary(
 ///   let plan_string = plan_string.replace(normalized.as_ref(), "WORKING_DIR");
 ///
 ///   assert_eq!("ProjectionExec: expr=[a@0 as a]\
-///              \n  CoalesceBatchesExec: target_batch_size=4096\
+///              \n  CoalesceBatchesExec: target_batch_size=8192\
 ///              \n    FilterExec: a@0 < 5\
-///              \n      RepartitionExec: partitioning=RoundRobinBatch(3)\
-///              \n        CsvExec: files=[WORKING_DIR/tests/example.csv], has_header=true, limit=None, projection=[a]",
+///              \n      RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1\
+///              \n        CsvExec: files={1 group: [[WORKING_DIR/tests/data/example.csv]]}, has_header=true, limit=None, projection=[a]",
 ///               plan_string.trim());
 ///
 ///   let one_line = format!("{}", displayable_plan.one_line());
@@ -310,7 +341,7 @@ pub fn displayable(plan: &dyn ExecutionPlan) -> DisplayableExecutionPlan<'_> {
 pub fn accept<V: ExecutionPlanVisitor>(
     plan: &dyn ExecutionPlan,
     visitor: &mut V,
-) -> std::result::Result<(), V::Error> {
+) -> Result<(), V::Error> {
     visitor.pre_visit(plan)?;
     for child in plan.children() {
         visit_execution_plan(child.as_ref(), visitor)?;
@@ -354,19 +385,13 @@ pub trait ExecutionPlanVisitor {
     /// recursion continues. If Err(..) or Ok(false) are returned, the
     /// recursion stops immediately and the error, if any, is returned
     /// to `accept`
-    fn pre_visit(
-        &mut self,
-        plan: &dyn ExecutionPlan,
-    ) -> std::result::Result<bool, Self::Error>;
+    fn pre_visit(&mut self, plan: &dyn ExecutionPlan) -> Result<bool, Self::Error>;
 
     /// Invoked on an `ExecutionPlan` plan *after* all of its child
     /// inputs have been visited. The return value is handled the same
     /// as the return value of `pre_visit`. The provided default
     /// implementation returns `Ok(true)`.
-    fn post_visit(
-        &mut self,
-        _plan: &dyn ExecutionPlan,
-    ) -> std::result::Result<bool, Self::Error> {
+    fn post_visit(&mut self, _plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {
         Ok(true)
     }
 }
@@ -376,7 +401,7 @@ pub trait ExecutionPlanVisitor {
 pub fn visit_execution_plan<V: ExecutionPlanVisitor>(
     plan: &dyn ExecutionPlan,
     visitor: &mut V,
-) -> std::result::Result<(), V::Error> {
+) -> Result<(), V::Error> {
     visitor.pre_visit(plan)?;
     for child in plan.children() {
         visit_execution_plan(child.as_ref(), visitor)?;
@@ -390,12 +415,12 @@ pub async fn collect(
     plan: Arc<dyn ExecutionPlan>,
     context: Arc<TaskContext>,
 ) -> Result<Vec<RecordBatch>> {
-    let stream = execute_stream(plan, context).await?;
+    let stream = execute_stream(plan, context)?;
     common::collect(stream).await
 }
 
 /// Execute the [ExecutionPlan] and return a single stream of results
-pub async fn execute_stream(
+pub fn execute_stream(
     plan: Arc<dyn ExecutionPlan>,
     context: Arc<TaskContext>,
 ) -> Result<SendableRecordBatchStream> {
@@ -417,7 +442,7 @@ pub async fn collect_partitioned(
     plan: Arc<dyn ExecutionPlan>,
     context: Arc<TaskContext>,
 ) -> Result<Vec<Vec<RecordBatch>>> {
-    let streams = execute_stream_partitioned(plan, context).await?;
+    let streams = execute_stream_partitioned(plan, context)?;
     let mut batches = Vec::with_capacity(streams.len());
     for stream in streams {
         batches.push(common::collect(stream).await?);
@@ -426,7 +451,7 @@ pub async fn collect_partitioned(
 }
 
 /// Execute the [ExecutionPlan] and return a vec with one stream per output partition
-pub async fn execute_stream_partitioned(
+pub fn execute_stream_partitioned(
     plan: Arc<dyn ExecutionPlan>,
     context: Arc<TaskContext>,
 ) -> Result<Vec<SendableRecordBatchStream>> {
@@ -458,6 +483,83 @@ impl Partitioning {
             RoundRobinBatch(n) | Hash(_, n) | UnknownPartitioning(n) => *n,
         }
     }
+
+    /// Returns true when the guarantees made by this [[Partitioning]] are sufficient to
+    /// satisfy the partitioning scheme mandated by the `required` [[Distribution]]
+    pub fn satisfy<F: FnOnce() -> EquivalenceProperties>(
+        &self,
+        required: Distribution,
+        equal_properties: F,
+    ) -> bool {
+        match required {
+            Distribution::UnspecifiedDistribution => true,
+            Distribution::SinglePartition if self.partition_count() == 1 => true,
+            Distribution::HashPartitioned(required_exprs) => {
+                match self {
+                    // Here we do not check the partition count for hash partitioning and assumes the partition count
+                    // and hash functions in the system are the same. In future if we plan to support storage partition-wise joins,
+                    // then we need to have the partition count and hash functions validation.
+                    Partitioning::Hash(partition_exprs, _) => {
+                        let fast_match =
+                            expr_list_eq_strict_order(&required_exprs, partition_exprs);
+                        // If the required exprs do not match, need to leverage the eq_properties provided by the child
+                        // and normalize both exprs based on the eq_properties
+                        if !fast_match {
+                            let eq_properties = equal_properties();
+                            let eq_classes = eq_properties.classes();
+                            if !eq_classes.is_empty() {
+                                let normalized_required_exprs = required_exprs
+                                    .iter()
+                                    .map(|e| {
+                                        normalize_expr_with_equivalence_properties(
+                                            e.clone(),
+                                            eq_classes,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                let normalized_partition_exprs = partition_exprs
+                                    .iter()
+                                    .map(|e| {
+                                        normalize_expr_with_equivalence_properties(
+                                            e.clone(),
+                                            eq_classes,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                expr_list_eq_strict_order(
+                                    &normalized_required_exprs,
+                                    &normalized_partition_exprs,
+                                )
+                            } else {
+                                fast_match
+                            }
+                        } else {
+                            fast_match
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq for Partitioning {
+    fn eq(&self, other: &Partitioning) -> bool {
+        match (self, other) {
+            (
+                Partitioning::RoundRobinBatch(count1),
+                Partitioning::RoundRobinBatch(count2),
+            ) if count1 == count2 => true,
+            (Partitioning::Hash(exprs1, count1), Partitioning::Hash(exprs2, count2))
+                if expr_list_eq_strict_order(exprs1, exprs2) && (count1 == count2) =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Distribution schemes
@@ -472,7 +574,27 @@ pub enum Distribution {
     HashPartitioned(Vec<Arc<dyn PhysicalExpr>>),
 }
 
+impl Distribution {
+    /// Creates a Partitioning for this Distribution to satisfy itself
+    pub fn create_partitioning(&self, partition_count: usize) -> Partitioning {
+        match self {
+            Distribution::UnspecifiedDistribution => {
+                Partitioning::UnknownPartitioning(partition_count)
+            }
+            Distribution::SinglePartition => Partitioning::UnknownPartitioning(1),
+            Distribution::HashPartitioned(expr) => {
+                Partitioning::Hash(expr.clone(), partition_count)
+            }
+        }
+    }
+}
+
+use datafusion_physical_expr::expressions::Column;
 pub use datafusion_physical_expr::window::WindowExpr;
+use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::{
+    expr_list_eq_strict_order, normalize_expr_with_equivalence_properties,
+};
 pub use datafusion_physical_expr::{AggregateExpr, PhysicalExpr};
 
 /// Applies an optional projection to a [`SchemaRef`], returning the
@@ -525,7 +647,6 @@ pub mod empty;
 pub mod explain;
 pub mod file_format;
 pub mod filter;
-pub mod hash_utils;
 pub mod joins;
 pub mod limit;
 pub mod memory;
@@ -533,12 +654,97 @@ pub mod metrics;
 pub mod planner;
 pub mod projection;
 pub mod repartition;
+pub mod rewrite;
 pub mod sorts;
 pub mod stream;
+pub mod streaming;
 pub mod udaf;
 pub mod union;
+pub mod unnest;
 pub mod values;
 pub mod windows;
 
 use crate::execution::context::TaskContext;
-pub use datafusion_physical_expr::{expressions, functions, type_coercion, udf};
+use crate::physical_plan::repartition::RepartitionExec;
+use crate::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+pub use datafusion_physical_expr::{
+    expressions, functions, hash_utils, type_coercion, udf,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+    use arrow::datatypes::Schema;
+
+    use crate::physical_plan::Distribution;
+    use crate::physical_plan::Partitioning;
+    use crate::physical_plan::PhysicalExpr;
+    use datafusion_physical_expr::expressions::Column;
+
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn partitioning_satisfy_distribution() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("column_1", DataType::Int64, false),
+            arrow::datatypes::Field::new("column_2", DataType::Utf8, false),
+        ]));
+
+        let partition_exprs1: Vec<Arc<dyn PhysicalExpr>> = vec![
+            Arc::new(Column::new_with_schema("column_1", &schema).unwrap()),
+            Arc::new(Column::new_with_schema("column_2", &schema).unwrap()),
+        ];
+
+        let partition_exprs2: Vec<Arc<dyn PhysicalExpr>> = vec![
+            Arc::new(Column::new_with_schema("column_2", &schema).unwrap()),
+            Arc::new(Column::new_with_schema("column_1", &schema).unwrap()),
+        ];
+
+        let distribution_types = vec![
+            Distribution::UnspecifiedDistribution,
+            Distribution::SinglePartition,
+            Distribution::HashPartitioned(partition_exprs1.clone()),
+        ];
+
+        let single_partition = Partitioning::UnknownPartitioning(1);
+        let unspecified_partition = Partitioning::UnknownPartitioning(10);
+        let round_robin_partition = Partitioning::RoundRobinBatch(10);
+        let hash_partition1 = Partitioning::Hash(partition_exprs1, 10);
+        let hash_partition2 = Partitioning::Hash(partition_exprs2, 10);
+
+        for distribution in distribution_types {
+            let result = (
+                single_partition.satisfy(distribution.clone(), || {
+                    EquivalenceProperties::new(schema.clone())
+                }),
+                unspecified_partition.satisfy(distribution.clone(), || {
+                    EquivalenceProperties::new(schema.clone())
+                }),
+                round_robin_partition.satisfy(distribution.clone(), || {
+                    EquivalenceProperties::new(schema.clone())
+                }),
+                hash_partition1.satisfy(distribution.clone(), || {
+                    EquivalenceProperties::new(schema.clone())
+                }),
+                hash_partition2.satisfy(distribution.clone(), || {
+                    EquivalenceProperties::new(schema.clone())
+                }),
+            );
+
+            match distribution {
+                Distribution::UnspecifiedDistribution => {
+                    assert_eq!(result, (true, true, true, true, true))
+                }
+                Distribution::SinglePartition => {
+                    assert_eq!(result, (true, false, false, false, false))
+                }
+                Distribution::HashPartitioned(_) => {
+                    assert_eq!(result, (false, false, false, true, false))
+                }
+            }
+        }
+
+        Ok(())
+    }
+}

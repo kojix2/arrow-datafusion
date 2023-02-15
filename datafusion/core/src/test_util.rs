@@ -18,7 +18,7 @@
 //! Utility functions to make testing DataFusion based crates easier
 
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::{env, error::Error, path::PathBuf, sync::Arc};
 
 use crate::datasource::datasource::TableProviderFactory;
@@ -29,7 +29,7 @@ use crate::physical_plan::ExecutionPlan;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion_common::DataFusionError;
-use datafusion_expr::{Expr, TableType};
+use datafusion_expr::{CreateExternalTable, Expr, TableType};
 
 /// Compares formatted output of a record batch with an expected
 /// vector of strings, with the result of pretty formatting record
@@ -121,7 +121,7 @@ macro_rules! assert_batches_sorted_eq {
 pub fn arrow_test_data() -> String {
     match get_data_dir("ARROW_TEST_DATA", "../../testing/data") {
         Ok(pb) => pb.display().to_string(),
-        Err(err) => panic!("failed to get arrow data dir: {}", err),
+        Err(err) => panic!("failed to get arrow data dir: {err}"),
     }
 }
 
@@ -143,7 +143,7 @@ pub fn arrow_test_data() -> String {
 pub fn parquet_test_data() -> String {
     match get_data_dir("PARQUET_TEST_DATA", "../../parquet-testing/data") {
         Ok(pb) => pb.display().to_string(),
-        Err(err) => panic!("failed to get parquet data dir: {}", err),
+        Err(err) => panic!("failed to get parquet data dir: {err}"),
     }
 }
 
@@ -156,7 +156,10 @@ pub fn parquet_test_data() -> String {
 ///  Returns either:
 /// The path referred to in `udf_env` if that variable is set and refers to a directory
 /// The submodule_data directory relative to CARGO_MANIFEST_PATH
-fn get_data_dir(udf_env: &str, submodule_data: &str) -> Result<PathBuf, Box<dyn Error>> {
+pub fn get_data_dir(
+    udf_env: &str,
+    submodule_data: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
     // Try user defined env.
     if let Ok(dir) = env::var(udf_env) {
         let trimmed = dir.trim().to_string();
@@ -229,9 +232,9 @@ pub fn scan_empty_with_partitions(
 /// Get the schema for the aggregate_test_* csv files
 pub fn aggr_test_schema() -> SchemaRef {
     let mut f1 = Field::new("c1", DataType::Utf8, false);
-    f1.set_metadata(Some(BTreeMap::from_iter(
+    f1.set_metadata(HashMap::from_iter(
         vec![("testing".into(), "test".into())].into_iter(),
-    )));
+    ));
     let schema = Schema::new(vec![
         f1,
         Field::new("c2", DataType::UInt32, false),
@@ -254,9 +257,9 @@ pub fn aggr_test_schema() -> SchemaRef {
 /// Get the schema for the aggregate_test_* csv files with an additional filed not present in the files.
 pub fn aggr_test_schema_with_missing_col() -> SchemaRef {
     let mut f1 = Field::new("c1", DataType::Utf8, false);
-    f1.set_metadata(Some(BTreeMap::from_iter(
+    f1.set_metadata(HashMap::from_iter(
         vec![("testing".into(), "test".into())].into_iter(),
-    )));
+    ));
     let schema = Schema::new(vec![
         f1,
         Field::new("c2", DataType::UInt32, false),
@@ -284,10 +287,12 @@ pub struct TestTableFactory {}
 impl TableProviderFactory for TestTableFactory {
     async fn create(
         &self,
-        url: &str,
+        _: &SessionState,
+        cmd: &CreateExternalTable,
     ) -> datafusion_common::Result<Arc<dyn TableProvider>> {
         Ok(Arc::new(TestTableProvider {
-            url: url.to_string(),
+            url: cmd.location.to_string(),
+            schema: Arc::new(cmd.schema.as_ref().into()),
         }))
     }
 }
@@ -296,6 +301,8 @@ impl TableProviderFactory for TestTableFactory {
 pub struct TestTableProvider {
     /// URL of table files or folder
     pub url: String,
+    /// test table schema
+    pub schema: SchemaRef,
 }
 
 impl TestTableProvider {}
@@ -307,11 +314,7 @@ impl TableProvider for TestTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        let schema = Schema::new(vec![
-            Field::new("a", DataType::Int64, true),
-            Field::new("b", DataType::Decimal128(15, 2), true),
-        ]);
-        Arc::new(schema)
+        self.schema.clone()
     }
 
     fn table_type(&self) -> TableType {
@@ -320,8 +323,8 @@ impl TableProvider for TestTableProvider {
 
     async fn scan(
         &self,
-        _ctx: &SessionState,
-        _projection: &Option<Vec<usize>>,
+        _state: &SessionState,
+        _projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {

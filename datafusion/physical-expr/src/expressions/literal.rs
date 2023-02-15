@@ -26,9 +26,9 @@ use arrow::{
 };
 
 use crate::physical_expr::down_cast_any_ref;
-use crate::{ExprBoundaries, PhysicalExpr, PhysicalExprStats};
+use crate::{AnalysisContext, ExprBoundaries, PhysicalExpr};
+use datafusion_common::Result;
 use datafusion_common::ScalarValue;
-use datafusion_common::{ColumnStatistics, Result};
 use datafusion_expr::{ColumnarValue, Expr};
 
 /// Represents a literal value
@@ -73,12 +73,6 @@ impl PhysicalExpr for Literal {
         Ok(ColumnarValue::Scalar(self.value.clone()))
     }
 
-    fn expr_stats(&self) -> Arc<dyn PhysicalExprStats> {
-        Arc::new(LiteralExprStats {
-            value: self.value.clone(),
-        })
-    }
-
     fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
         vec![]
     }
@@ -89,6 +83,16 @@ impl PhysicalExpr for Literal {
     ) -> Result<Arc<dyn PhysicalExpr>> {
         Ok(self)
     }
+
+    /// Return the boundaries of this literal expression (which is the same as
+    /// the value it represents).
+    fn analyze(&self, context: AnalysisContext) -> AnalysisContext {
+        context.with_boundaries(Some(ExprBoundaries::new(
+            self.value.clone(),
+            self.value.clone(),
+            Some(1),
+        )))
+    }
 }
 
 impl PartialEq<dyn Any> for Literal {
@@ -97,23 +101,6 @@ impl PartialEq<dyn Any> for Literal {
             .downcast_ref::<Self>()
             .map(|x| self == x)
             .unwrap_or(false)
-    }
-}
-
-struct LiteralExprStats {
-    value: ScalarValue,
-}
-
-impl PhysicalExprStats for LiteralExprStats {
-    #[allow(unused_variables)]
-    /// A literal's boundaries are the same as its value's boundaries (since it is a
-    /// scalar, both min/max are the same).
-    fn boundaries(&self, columns: &[ColumnStatistics]) -> Option<ExprBoundaries> {
-        Some(ExprBoundaries::new(
-            self.value.clone(),
-            self.value.clone(),
-            Some(1),
-        ))
     }
 }
 
@@ -130,6 +117,7 @@ mod tests {
     use super::*;
     use arrow::array::Int32Array;
     use arrow::datatypes::*;
+    use datafusion_common::cast::as_int32_array;
     use datafusion_common::Result;
 
     #[test]
@@ -141,10 +129,10 @@ mod tests {
 
         // create and evaluate a literal expression
         let literal_expr = lit(42i32);
-        assert_eq!("42", format!("{}", literal_expr));
+        assert_eq!("42", format!("{literal_expr}"));
 
         let literal_array = literal_expr.evaluate(&batch)?.into_array(batch.num_rows());
-        let literal_array = literal_array.as_any().downcast_ref::<Int32Array>().unwrap();
+        let literal_array = as_int32_array(&literal_array)?;
 
         // note that the contents of the literal array are unrelated to the batch contents except for the length of the array
         assert_eq!(literal_array.len(), 5); // 5 rows in the batch
@@ -156,10 +144,13 @@ mod tests {
     }
 
     #[test]
-    fn literal_stats() -> Result<()> {
+    fn literal_bounds_analysis() -> Result<()> {
+        let schema = Schema::new(vec![]);
+        let context = AnalysisContext::new(&schema, vec![]);
+
         let literal_expr = lit(42i32);
-        let stats = literal_expr.expr_stats();
-        let boundaries = stats.boundaries(&[]).unwrap();
+        let result_ctx = literal_expr.analyze(context);
+        let boundaries = result_ctx.boundaries.unwrap();
         assert_eq!(boundaries.min_value, ScalarValue::Int32(Some(42)));
         assert_eq!(boundaries.max_value, ScalarValue::Int32(Some(42)));
         assert_eq!(boundaries.distinct_count, Some(1));

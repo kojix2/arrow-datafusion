@@ -25,6 +25,18 @@ execution. The SQL types from
 are mapped to [Arrow data types](https://docs.rs/arrow/latest/arrow/datatypes/enum.DataType.html) according to the following table.
 This mapping occurs when defining the schema in a `CREATE EXTERNAL TABLE` command or when performing a SQL `CAST` operation.
 
+You can see the corresponding Arrow type for any SQL expression using
+the `arrow_typeof` function. For example:
+
+```sql
+❯ select arrow_typeof(interval '1 month');
++-------------------------------------+
+| arrowtypeof(IntervalYearMonth("1")) |
++-------------------------------------+
+| Interval(YearMonth)                 |
++-------------------------------------+
+```
+
 ## Character Types
 
 | SQL DataType | Arrow DataType |
@@ -32,31 +44,33 @@ This mapping occurs when defining the schema in a `CREATE EXTERNAL TABLE` comman
 | `CHAR`       | `Utf8`         |
 | `VARCHAR`    | `Utf8`         |
 | `TEXT`       | `Utf8`         |
+| `STRING`     | `Utf8`         |
 
 ## Numeric Types
 
-| SQL DataType                         | Arrow DataType    |
-| ------------------------------------ | :---------------- |
-| `TINYINT`                            | `Int8`            |
-| `SMALLINT`                           | `Int16`           |
-| `INT` or `INTEGER`                   | `Int32`           |
-| `BIGINT`                             | `Int64`           |
-| `TINYINT UNSIGNED`                   | `UInt8`           |
-| `SMALLINT UNSIGNED`                  | `UInt16`          |
-| `INT UNSIGNED` or `INTEGER UNSIGNED` | `UInt32`          |
-| `BIGINT UNSIGNED`                    | `UInt64`          |
-| `FLOAT`                              | `Float32`         |
-| `REAL`                               | `Float32`         |
-| `DOUBLE`                             | `Float64`         |
-| `DECIMAL(p,s)`                       | `Decimal128(p,s)` |
+| SQL DataType                         | Arrow DataType                | Notes                                                                                                       |
+| ------------------------------------ | :---------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `TINYINT`                            | `Int8`                        |                                                                                                             |
+| `SMALLINT`                           | `Int16`                       |                                                                                                             |
+| `INT` or `INTEGER`                   | `Int32`                       |                                                                                                             |
+| `BIGINT`                             | `Int64`                       |                                                                                                             |
+| `TINYINT UNSIGNED`                   | `UInt8`                       |                                                                                                             |
+| `SMALLINT UNSIGNED`                  | `UInt16`                      |                                                                                                             |
+| `INT UNSIGNED` or `INTEGER UNSIGNED` | `UInt32`                      |                                                                                                             |
+| `BIGINT UNSIGNED`                    | `UInt64`                      |                                                                                                             |
+| `FLOAT`                              | `Float32`                     |                                                                                                             |
+| `REAL`                               | `Float32`                     |                                                                                                             |
+| `DOUBLE`                             | `Float64`                     |                                                                                                             |
+| `DECIMAL(precision,scale)`           | `Decimal128(precision,scale)` | Decimal support is currently experimental ([#3523](https://github.com/apache/arrow-datafusion/issues/3523)) |
 
 ## Date/Time Types
 
-| SQL DataType | Arrow DataType                          |
-| ------------ | :-------------------------------------- |
-| `DATE`       | `Date32`                                |
-| `TIME`       | `Time64(TimeUnit::Nanosecond)`          |
-| `TIMESTAMP`  | `Timestamp(TimeUnit::Nanosecond, None)` |
+| SQL DataType | Arrow DataType                                                           |
+| ------------ | :----------------------------------------------------------------------- |
+| `DATE`       | `Date32`                                                                 |
+| `TIME`       | `Time64(TimeUnit::Nanosecond)`                                           |
+| `TIMESTAMP`  | `Timestamp(TimeUnit::Nanosecond, None)`                                  |
+| `INTERVAL`   | `Interval(IntervalUnit::YearMonth)` or `Interval(IntervalUnit::DayTime)` |
 
 ## Boolean Types
 
@@ -81,10 +95,8 @@ This mapping occurs when defining the schema in a `CREATE EXTERNAL TABLE` comman
 | `VARBINARY`   | _Not yet supported_ |
 | `REGCLASS`    | _Not yet supported_ |
 | `NVARCHAR`    | _Not yet supported_ |
-| `STRING`      | _Not yet supported_ |
 | `CUSTOM`      | _Not yet supported_ |
 | `ARRAY`       | _Not yet supported_ |
 | `ENUM`        | _Not yet supported_ |
 | `SET`         | _Not yet supported_ |
-| `INTERVAL`    | _Not yet supported_ |
 | `DATETIME`    | _Not yet supported_ |

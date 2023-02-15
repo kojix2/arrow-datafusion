@@ -22,23 +22,21 @@
 //! compliant with the `SendableRecordBatchStream` trait.
 
 use std::collections::VecDeque;
+use std::mem;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
 use arrow::datatypes::SchemaRef;
-use arrow::{error::Result as ArrowResult, record_batch::RecordBatch};
+use arrow::error::ArrowError;
+use arrow::record_batch::RecordBatch;
+use datafusion_common::ScalarValue;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{ready, FutureExt, Stream, StreamExt};
-use object_store::ObjectStore;
-
-use datafusion_common::ScalarValue;
 
 use crate::datasource::listing::PartitionedFile;
 use crate::error::Result;
-use crate::execution::context::TaskContext;
 use crate::physical_plan::file_format::{
     FileMeta, FileScanConfig, PartitionColumnProjector,
 };
@@ -49,18 +47,16 @@ use crate::physical_plan::RecordBatchStream;
 
 /// A fallible future that resolves to a stream of [`RecordBatch`]
 pub type FileOpenFuture =
-    BoxFuture<'static, Result<BoxStream<'static, ArrowResult<RecordBatch>>>>;
+    BoxFuture<'static, Result<BoxStream<'static, Result<RecordBatch, ArrowError>>>>;
 
 /// Generic API for opening a file using an [`ObjectStore`] and resolving to a
 /// stream of [`RecordBatch`]
+///
+/// [`ObjectStore`]: object_store::ObjectStore
 pub trait FileOpener: Unpin {
     /// Asynchronously open the specified file and return a stream
     /// of [`RecordBatch`]
-    fn open(
-        &self,
-        store: Arc<dyn ObjectStore>,
-        file_meta: FileMeta,
-    ) -> Result<FileOpenFuture>;
+    fn open(&self, file_meta: FileMeta) -> Result<FileOpenFuture>;
 }
 
 /// A stream that iterates record batch by record batch, file over file.
@@ -79,8 +75,6 @@ pub struct FileStream<F: FileOpener> {
     file_reader: F,
     /// The partition column projector
     pc_projector: PartitionColumnProjector,
-    /// the store from which to source the files.
-    object_store: Arc<dyn ObjectStore>,
     /// The stream state
     state: FileStreamState,
     /// File stream specific metrics
@@ -106,7 +100,12 @@ enum FileStreamState {
         /// Partitioning column values for the current batch_iter
         partition_values: Vec<ScalarValue>,
         /// The reader instance
-        reader: BoxStream<'static, ArrowResult<RecordBatch>>,
+        reader: BoxStream<'static, Result<RecordBatch, ArrowError>>,
+        /// A [`FileOpenFuture`] for the next file to be processed,
+        /// and its corresponding partition column values, if any.
+        /// This allows the next file to be opened in parallel while the
+        /// current file is read.
+        next: Option<(FileOpenFuture, Vec<ScalarValue>)>,
     },
     /// Encountered an error
     Error,
@@ -137,7 +136,9 @@ struct FileStreamMetrics {
     /// Time elapsed for file opening
     pub time_opening: StartableTime,
     /// Time elapsed for file scanning + first record batch of decompression + decoding
-    pub time_scanning: StartableTime,
+    pub time_scanning_until_data: StartableTime,
+    /// Total elapsed time for for scanning + record batch decompression / decoding
+    pub time_scanning_total: StartableTime,
     /// Time elapsed for data decompression + decoding
     pub time_processing: StartableTime,
 }
@@ -150,9 +151,15 @@ impl FileStreamMetrics {
             start: None,
         };
 
-        let time_scanning = StartableTime {
+        let time_scanning_until_data = StartableTime {
             metrics: MetricBuilder::new(metrics)
-                .subset_time("time_elapsed_scanning", partition),
+                .subset_time("time_elapsed_scanning_until_data", partition),
+            start: None,
+        };
+
+        let time_scanning_total = StartableTime {
+            metrics: MetricBuilder::new(metrics)
+                .subset_time("time_elapsed_scanning_total", partition),
             start: None,
         };
 
@@ -164,7 +171,8 @@ impl FileStreamMetrics {
 
         Self {
             time_opening,
-            time_scanning,
+            time_scanning_until_data,
+            time_scanning_total,
             time_processing,
         }
     }
@@ -175,21 +183,20 @@ impl<F: FileOpener> FileStream<F> {
     pub fn new(
         config: &FileScanConfig,
         partition: usize,
-        context: Arc<TaskContext>,
         file_reader: F,
-        metrics: ExecutionPlanMetricsSet,
+        metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Self> {
         let (projected_schema, _) = config.project();
         let pc_projector = PartitionColumnProjector::new(
             projected_schema.clone(),
-            &config.table_partition_cols,
+            &config
+                .table_partition_cols
+                .iter()
+                .map(|x| x.0.clone())
+                .collect::<Vec<_>>(),
         );
 
         let files = config.file_groups[partition].clone();
-
-        let object_store = context
-            .runtime_env()
-            .object_store(&config.object_store_url)?;
 
         Ok(Self {
             file_iter: files.into(),
@@ -197,43 +204,48 @@ impl<F: FileOpener> FileStream<F> {
             remain: config.limit,
             file_reader,
             pc_projector,
-            object_store,
             state: FileStreamState::Idle,
-            file_stream_metrics: FileStreamMetrics::new(&metrics, partition),
-            baseline_metrics: BaselineMetrics::new(&metrics, partition),
+            file_stream_metrics: FileStreamMetrics::new(metrics, partition),
+            baseline_metrics: BaselineMetrics::new(metrics, partition),
         })
     }
 
-    fn poll_inner(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<ArrowResult<RecordBatch>>> {
+    // Begin opening the next file in parallel while decoding the current file in FileStream.
+    // Since file opening is mostly IO (and may involve a
+    // bunch of sequential IO), it can be parallelized with decoding.
+    fn start_next_file(&mut self) -> Option<Result<(FileOpenFuture, Vec<ScalarValue>)>> {
+        let part_file = self.file_iter.pop_front()?;
+
+        let file_meta = FileMeta {
+            object_meta: part_file.object_meta,
+            range: part_file.range,
+            extensions: part_file.extensions,
+        };
+
+        Some(
+            self.file_reader
+                .open(file_meta)
+                .map(|future| (future, part_file.partition_values)),
+        )
+    }
+
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
         loop {
             match &mut self.state {
                 FileStreamState::Idle => {
-                    let part_file = match self.file_iter.pop_front() {
-                        Some(file) => file,
-                        None => return Poll::Ready(None),
-                    };
-
-                    let file_meta = FileMeta {
-                        object_meta: part_file.object_meta,
-                        range: part_file.range,
-                        extensions: part_file.extensions,
-                    };
-
                     self.file_stream_metrics.time_opening.start();
 
-                    match self.file_reader.open(self.object_store.clone(), file_meta) {
-                        Ok(future) => {
+                    match self.start_next_file().transpose() {
+                        Ok(Some((future, partition_values))) => {
                             self.state = FileStreamState::Open {
                                 future,
-                                partition_values: part_file.partition_values,
+                                partition_values,
                             }
                         }
+                        Ok(None) => return Poll::Ready(None),
                         Err(e) => {
                             self.state = FileStreamState::Error;
-                            return Poll::Ready(Some(Err(e.into())));
+                            return Poll::Ready(Some(Err(e)));
                         }
                     }
                 }
@@ -242,26 +254,54 @@ impl<F: FileOpener> FileStream<F> {
                     partition_values,
                 } => match ready!(future.poll_unpin(cx)) {
                     Ok(reader) => {
+                        let partition_values = mem::take(partition_values);
+
+                        let next = self.start_next_file().transpose();
+
                         self.file_stream_metrics.time_opening.stop();
-                        self.file_stream_metrics.time_scanning.start();
-                        self.state = FileStreamState::Scan {
-                            partition_values: std::mem::take(partition_values),
-                            reader,
-                        };
+                        self.file_stream_metrics.time_scanning_until_data.start();
+                        self.file_stream_metrics.time_scanning_total.start();
+
+                        match next {
+                            Ok(Some((next_future, next_partition_values))) => {
+                                self.state = FileStreamState::Scan {
+                                    partition_values,
+                                    reader,
+                                    next: Some((next_future, next_partition_values)),
+                                };
+                            }
+                            Ok(None) => {
+                                self.state = FileStreamState::Scan {
+                                    reader,
+                                    partition_values,
+                                    next: None,
+                                };
+                            }
+                            Err(e) => {
+                                self.state = FileStreamState::Error;
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                        }
                     }
                     Err(e) => {
                         self.state = FileStreamState::Error;
-                        return Poll::Ready(Some(Err(e.into())));
+                        return Poll::Ready(Some(Err(e)));
                     }
                 },
                 FileStreamState::Scan {
                     reader,
                     partition_values,
+                    next,
                 } => match ready!(reader.poll_next_unpin(cx)) {
                     Some(result) => {
-                        self.file_stream_metrics.time_scanning.stop();
+                        self.file_stream_metrics.time_scanning_until_data.stop();
+                        self.file_stream_metrics.time_scanning_total.stop();
                         let result = result
-                            .and_then(|b| self.pc_projector.project(b, partition_values))
+                            .and_then(|b| {
+                                self.pc_projector
+                                    .project(b, partition_values)
+                                    .map_err(|e| ArrowError::ExternalError(e.into()))
+                            })
                             .map(|batch| match &mut self.remain {
                                 Some(remain) => {
                                     if *remain > batch.num_rows() {
@@ -280,12 +320,24 @@ impl<F: FileOpener> FileStream<F> {
                         if result.is_err() {
                             self.state = FileStreamState::Error
                         }
-
-                        return Poll::Ready(Some(result));
+                        self.file_stream_metrics.time_scanning_total.start();
+                        return Poll::Ready(Some(result.map_err(Into::into)));
                     }
                     None => {
-                        self.file_stream_metrics.time_scanning.stop();
-                        self.state = FileStreamState::Idle;
+                        self.file_stream_metrics.time_scanning_until_data.stop();
+                        self.file_stream_metrics.time_scanning_total.stop();
+
+                        match mem::take(next) {
+                            Some((future, partition_values)) => {
+                                self.file_stream_metrics.time_opening.start();
+
+                                self.state = FileStreamState::Open {
+                                    future,
+                                    partition_values,
+                                }
+                            }
+                            None => return Poll::Ready(None),
+                        }
                     }
                 },
                 FileStreamState::Error | FileStreamState::Limit => {
@@ -297,7 +349,7 @@ impl<F: FileOpener> FileStream<F> {
 }
 
 impl<F: FileOpener> Stream for FileStream<F> {
-    type Item = ArrowResult<RecordBatch>;
+    type Item = Result<RecordBatch>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -321,7 +373,6 @@ mod tests {
     use futures::StreamExt;
 
     use super::*;
-    use crate::config::ConfigOptions;
     use crate::datasource::object_store::ObjectStoreUrl;
     use crate::physical_plan::metrics::ExecutionPlanMetricsSet;
     use crate::prelude::SessionContext;
@@ -335,11 +386,7 @@ mod tests {
     }
 
     impl FileOpener for TestOpener {
-        fn open(
-            &self,
-            _store: Arc<dyn ObjectStore>,
-            _file_meta: FileMeta,
-        ) -> Result<FileOpenFuture> {
+        fn open(&self, _file_meta: FileMeta) -> Result<FileOpenFuture> {
             let iterator = self.records.clone().into_iter().map(Ok);
             let stream = futures::stream::iter(iterator).boxed();
             Ok(futures::future::ready(Ok(stream)).boxed())
@@ -367,17 +414,11 @@ mod tests {
             projection: None,
             limit,
             table_partition_cols: vec![],
-            config_options: ConfigOptions::new().into_shareable(),
+            output_ordering: None,
+            infinite_source: false,
         };
-
-        let file_stream = FileStream::new(
-            &config,
-            0,
-            ctx.task_ctx(),
-            reader,
-            ExecutionPlanMetricsSet::new(),
-        )
-        .unwrap();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let file_stream = FileStream::new(&config, 0, reader, &metrics_set).unwrap();
 
         file_stream
             .map(|b| b.expect("No error expected in stream"))

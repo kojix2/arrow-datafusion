@@ -25,15 +25,14 @@ use std::task::{Context, Poll};
 
 use crate::error::Result;
 use crate::physical_plan::{
-    DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
-    SendableRecordBatchStream,
+    DisplayFormatType, EquivalenceProperties, ExecutionPlan, Partitioning,
+    RecordBatchStream, SendableRecordBatchStream,
 };
 
 use crate::execution::context::TaskContext;
-use arrow::compute::kernels::concat::concat;
 use arrow::datatypes::SchemaRef;
 use arrow::error::Result as ArrowResult;
-use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use arrow::record_batch::RecordBatch;
 use futures::stream::{Stream, StreamExt};
 use log::trace;
 
@@ -96,12 +95,20 @@ impl ExecutionPlan for CoalesceBatchesExec {
         self.input.output_partitioning()
     }
 
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
+    /// Specifies whether this plan generates an infinite stream of records.
+    /// If the plan does not support pipelining, but it its input(s) are
+    /// infinite, returns an error to indicate this.
+    fn unbounded_output(&self, children: &[bool]) -> Result<bool> {
+        Ok(children[0])
     }
 
-    fn relies_on_input_order(&self) -> bool {
-        false
+    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
+        // The coalesce batches operator does not make any changes to the sorting of its input
+        self.input.output_ordering()
+    }
+
+    fn equivalence_properties(&self) -> EquivalenceProperties {
+        self.input.equivalence_properties()
     }
 
     fn with_new_children(
@@ -173,7 +180,7 @@ struct CoalesceBatchesStream {
 }
 
 impl Stream for CoalesceBatchesStream {
-    type Item = ArrowResult<RecordBatch>;
+    type Item = Result<RecordBatch>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -193,17 +200,17 @@ impl CoalesceBatchesStream {
     fn poll_next_inner(
         self: &mut Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<ArrowResult<RecordBatch>>> {
+    ) -> Poll<Option<Result<RecordBatch>>> {
         // Get a clone (uses same underlying atomic) as self gets borrowed below
         let cloned_time = self.baseline_metrics.elapsed_compute().clone();
-        // records time on drop
-        let _timer = cloned_time.timer();
 
         if self.is_closed {
             return Poll::Ready(None);
         }
         loop {
             let input_batch = self.input.poll_next_unpin(cx);
+            // records time on drop
+            let _timer = cloned_time.timer();
             match input_batch {
                 Poll::Ready(x) => match x {
                     Some(Ok(ref batch)) => {
@@ -273,47 +280,33 @@ pub fn concat_batches(
     batches: &[RecordBatch],
     row_count: usize,
 ) -> ArrowResult<RecordBatch> {
-    if batches.is_empty() {
-        return Ok(RecordBatch::new_empty(schema.clone()));
-    }
-    let mut arrays = Vec::with_capacity(schema.fields().len());
-    for i in 0..schema.fields().len() {
-        let array = concat(
-            &batches
-                .iter()
-                .map(|batch| batch.column(i).as_ref())
-                .collect::<Vec<_>>(),
-        )?;
-        arrays.push(array);
-    }
     trace!(
         "Combined {} batches containing {} rows",
         batches.len(),
         row_count
     );
-
-    let options = RecordBatchOptions::new().with_row_count(Some(row_count));
-
-    RecordBatch::try_new_with_options(schema.clone(), arrays, &options)
+    let b = arrow::compute::concat_batches(schema, batches)?;
+    Ok(b)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{OPT_COALESCE_BATCHES, OPT_COALESCE_TARGET_BATCH_SIZE};
+    use crate::config::ConfigOptions;
     use crate::datasource::MemTable;
     use crate::physical_plan::filter::FilterExec;
     use crate::physical_plan::projection::ProjectionExec;
     use crate::physical_plan::{memory::MemoryExec, repartition::RepartitionExec};
-    use crate::prelude::{SessionConfig, SessionContext};
+    use crate::prelude::SessionContext;
     use crate::test::create_vec_batches;
     use arrow::datatypes::{DataType, Field, Schema};
 
     #[tokio::test]
     async fn test_custom_batch_size() -> Result<()> {
-        let ctx = SessionContext::with_config(
-            SessionConfig::new().set_u64(OPT_COALESCE_TARGET_BATCH_SIZE, 1234),
-        );
+        let mut config = ConfigOptions::new();
+        config.execution.batch_size = 1234;
+
+        let ctx = SessionContext::with_config(config.into());
         let plan = create_physical_plan(ctx).await?;
         let projection = plan.as_any().downcast_ref::<ProjectionExec>().unwrap();
         let coalesce = projection
@@ -327,9 +320,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_disable_coalesce() -> Result<()> {
-        let ctx = SessionContext::with_config(
-            SessionConfig::new().set_bool(OPT_COALESCE_BATCHES, false),
-        );
+        let mut config = ConfigOptions::new();
+        config.execution.coalesce_batches = false;
+
+        let ctx = SessionContext::with_config(config.into());
         let plan = create_physical_plan(ctx).await?;
         let projection = plan.as_any().downcast_ref::<ProjectionExec>().unwrap();
         // projection should directly wrap filter with no coalesce step
@@ -346,8 +340,8 @@ mod tests {
         let partition = create_vec_batches(&schema, 10);
         let table = MemTable::try_new(schema, vec![partition])?;
         ctx.register_table("a", Arc::new(table))?;
-        let plan = ctx.create_logical_plan("SELECT * FROM a WHERE c0 < 1")?;
-        ctx.create_physical_plan(&plan).await
+        let dataframe = ctx.sql("SELECT * FROM a WHERE c0 < 1").await?;
+        dataframe.create_physical_plan().await
     }
 
     #[tokio::test(flavor = "multi_thread")]

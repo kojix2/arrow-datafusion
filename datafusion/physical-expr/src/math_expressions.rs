@@ -170,8 +170,7 @@ pub fn power(args: &[ArrayRef]) -> Result<ArrayRef> {
         )) as ArrayRef),
 
         other => Err(DataFusionError::Internal(format!(
-            "Unsupported data type {:?} for function power",
-            other
+            "Unsupported data type {other:?} for function power"
         ))),
     }
 }
@@ -197,8 +196,41 @@ pub fn atan2(args: &[ArrayRef]) -> Result<ArrayRef> {
         )) as ArrayRef),
 
         other => Err(DataFusionError::Internal(format!(
-            "Unsupported data type {:?} for function atan2",
-            other
+            "Unsupported data type {other:?} for function atan2"
+        ))),
+    }
+}
+
+pub fn log(args: &[ArrayRef]) -> Result<ArrayRef> {
+    // Support overloaded log(base, x) and log(x) which defaults to log(10, x)
+    // note in f64::log params order is different than in sql. e.g in sql log(base, x) == f64::log(x, base)
+    let mut base = &(Arc::new(Float32Array::from_value(10.0, args[0].len())) as ArrayRef);
+    let mut x = &args[0];
+    if args.len() == 2 {
+        x = &args[1];
+        base = &args[0];
+    }
+    match args[0].data_type() {
+        DataType::Float64 => Ok(Arc::new(make_function_inputs2!(
+            x,
+            base,
+            "x",
+            "base",
+            Float64Array,
+            { f64::log }
+        )) as ArrayRef),
+
+        DataType::Float32 => Ok(Arc::new(make_function_inputs2!(
+            x,
+            base,
+            "x",
+            "base",
+            Float32Array,
+            { f32::log }
+        )) as ArrayRef),
+
+        other => Err(DataFusionError::Internal(format!(
+            "Unsupported data type {other:?} for function log"
         ))),
     }
 }
@@ -207,13 +239,14 @@ pub fn atan2(args: &[ArrayRef]) -> Result<ArrayRef> {
 mod tests {
 
     use super::*;
-    use arrow::array::{Array, Float64Array, NullArray};
+    use arrow::array::{Float64Array, NullArray};
+    use datafusion_common::cast::{as_float32_array, as_float64_array};
 
     #[test]
     fn test_random_expression() {
         let args = vec![ColumnarValue::Array(Arc::new(NullArray::new(1)))];
         let array = random(&args).expect("fail").into_array(1);
-        let floats = array.as_any().downcast_ref::<Float64Array>().expect("fail");
+        let floats = as_float64_array(&array).expect("fail");
 
         assert_eq!(floats.len(), 1);
         assert!(0.0 <= floats.value(0) && floats.value(0) < 1.0);
@@ -227,10 +260,7 @@ mod tests {
         ];
 
         let result = atan2(&args).expect("fail");
-        let floats = result
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("fail");
+        let floats = as_float64_array(&result).expect("fail");
 
         assert_eq!(floats.len(), 4);
         assert_eq!(floats.value(0), (2.0_f64).atan2(1.0));
@@ -247,10 +277,7 @@ mod tests {
         ];
 
         let result = atan2(&args).expect("fail");
-        let floats = result
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .expect("fail");
+        let floats = as_float32_array(&result).expect("fail");
 
         assert_eq!(floats.len(), 4);
         assert_eq!(floats.value(0), (2.0_f32).atan2(1.0));

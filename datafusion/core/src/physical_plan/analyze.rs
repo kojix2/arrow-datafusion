@@ -41,7 +41,7 @@ pub struct AnalyzeExec {
     /// control how much extra to print
     verbose: bool,
     /// The input plan (the plan being analyzed)
-    input: Arc<dyn ExecutionPlan>,
+    pub(crate) input: Arc<dyn ExecutionPlan>,
     /// The output schema for RecordBatches of this exec node
     schema: SchemaRef,
 }
@@ -72,8 +72,22 @@ impl ExecutionPlan for AnalyzeExec {
     }
 
     /// Specifies we want the input as a single stream
-    fn required_child_distribution(&self) -> Distribution {
-        Distribution::SinglePartition
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+
+    /// Specifies whether this plan generates an infinite stream of records.
+    /// If the plan does not support pipelining, but it its input(s) are
+    /// infinite, returns an error to indicate this.
+    fn unbounded_output(&self, children: &[bool]) -> Result<bool> {
+        if children[0] {
+            Err(DataFusionError::Plan(
+                "Analyze Error: Analysis is not supported for unbounded inputs"
+                    .to_string(),
+            ))
+        } else {
+            Ok(false)
+        }
     }
 
     /// Get the output partitioning of this plan
@@ -83,10 +97,6 @@ impl ExecutionPlan for AnalyzeExec {
 
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
         None
-    }
-
-    fn relies_on_input_order(&self) -> bool {
-        false
     }
 
     fn with_new_children(
@@ -107,8 +117,7 @@ impl ExecutionPlan for AnalyzeExec {
     ) -> Result<SendableRecordBatchStream> {
         if 0 != partition {
             return Err(DataFusionError::Internal(format!(
-                "AnalyzeExec invalid partition. Expected 0, got {}",
-                partition
+                "AnalyzeExec invalid partition. Expected 0, got {partition}"
             )));
         }
 
@@ -116,8 +125,7 @@ impl ExecutionPlan for AnalyzeExec {
         let input_partitions = self.input.output_partitioning().partition_count();
         if input_partitions != 1 {
             return Err(DataFusionError::Internal(format!(
-                "AnalyzeExec invalid number of input partitions. Expected 1, got {}",
-                input_partitions
+                "AnalyzeExec invalid number of input partitions. Expected 1, got {input_partitions}"
             )));
         }
 
@@ -192,7 +200,8 @@ impl ExecutionPlan for AnalyzeExec {
                     Arc::new(type_builder.finish()),
                     Arc::new(plan_builder.finish()),
                 ],
-            );
+            )
+            .map_err(Into::into);
             // again ignore error
             tx.send(maybe_batch).await.ok();
         });

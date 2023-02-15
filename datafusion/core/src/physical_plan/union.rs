@@ -21,15 +21,19 @@
 
 //! The Union operator combines multiple inputs with the same schema
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::{any::Any, sync::Arc};
 
 use arrow::{
     datatypes::{Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
-use futures::StreamExt;
+use datafusion_common::{DFSchemaRef, DataFusionError};
+use futures::{Stream, StreamExt};
 use itertools::Itertools;
 use log::debug;
+use log::warn;
 
 use super::{
     expressions::PhysicalSortExpr,
@@ -38,12 +42,50 @@ use super::{
     SendableRecordBatchStream, Statistics,
 };
 use crate::execution::context::TaskContext;
+use crate::physical_plan::common::get_meet_of_orderings;
 use crate::{
     error::Result,
     physical_plan::{expressions, metrics::BaselineMetrics},
 };
+use tokio::macros::support::thread_rng_n;
 
-/// UNION ALL execution plan
+/// `UnionExec`: `UNION ALL` execution plan.
+///
+/// `UnionExec` combines multiple inputs with the same schema by
+/// concatenating the partitions.  It does not mix or copy data within
+/// or across partitions. Thus if the input partitions are sorted, the
+/// output partitions of the union are also sorted.
+///
+/// For example, given a `UnionExec` of two inputs, with `N`
+/// partitions, and `M` partitions, there will be `N+M` output
+/// partitions. The first `N` output partitions are from Input 1
+/// partitions, and then next `M` output partitions are from Input 2.
+///
+/// ```text
+///                       ▲       ▲           ▲         ▲
+///                       │       │           │         │
+///     Output            │  ...  │           │         │
+///   Partitions          │0      │N-1        │ N       │N+M-1
+///(passes through   ┌────┴───────┴───────────┴─────────┴───┐
+/// the N+M input    │              UnionExec               │
+///  partitions)     │                                      │
+///                  └──────────────────────────────────────┘
+///                                      ▲
+///                                      │
+///                                      │
+///       Input           ┌────────┬─────┴────┬──────────┐
+///     Partitions        │ ...    │          │     ...  │
+///                    0  │        │ N-1      │ 0        │  M-1
+///                  ┌────┴────────┴───┐  ┌───┴──────────┴───┐
+///                  │                 │  │                  │
+///                  │                 │  │                  │
+///                  │                 │  │                  │
+///                  │                 │  │                  │
+///                  │                 │  │                  │
+///                  │                 │  │                  │
+///                  │Input 1          │  │Input 2           │
+///                  └─────────────────┘  └──────────────────┘
+/// ```
 #[derive(Debug)]
 pub struct UnionExec {
     /// Input execution plan
@@ -52,9 +94,43 @@ pub struct UnionExec {
     metrics: ExecutionPlanMetricsSet,
     /// Schema of Union
     schema: SchemaRef,
+    /// Partition aware Union
+    partition_aware: bool,
 }
 
 impl UnionExec {
+    /// Create a new UnionExec with specified schema.
+    /// The `schema` should always be a subset of the schema of `inputs`,
+    /// otherwise, an error will be returned.
+    pub fn try_new_with_schema(
+        inputs: Vec<Arc<dyn ExecutionPlan>>,
+        schema: DFSchemaRef,
+    ) -> Result<Self> {
+        let mut exec = Self::new(inputs);
+        let exec_schema = exec.schema();
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|dff| {
+                exec_schema
+                    .field_with_name(dff.name())
+                    .cloned()
+                    .map_err(|_| {
+                        DataFusionError::Internal(format!(
+                            "Cannot find the field {:?} in child schema",
+                            dff.name()
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<Field>>>()?;
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            exec.schema().metadata().clone(),
+        ));
+        exec.schema = schema;
+        Ok(exec)
+    }
+
     /// Create a new UnionExec
     pub fn new(inputs: Vec<Arc<dyn ExecutionPlan>>) -> Self {
         let fields: Vec<Field> = (0..inputs[0].schema().fields().len())
@@ -78,10 +154,24 @@ impl UnionExec {
             inputs[0].schema().metadata().clone(),
         ));
 
+        // If all the input partitions have the same Hash partition spec with the first_input_partition
+        // The UnionExec is partition aware.
+        //
+        // It might be too strict here in the case that the input partition specs are compatible but not exactly the same.
+        // For example one input partition has the partition spec Hash('a','b','c') and
+        // other has the partition spec Hash('a'), It is safe to derive the out partition with the spec Hash('a','b','c').
+        let first_input_partition = inputs[0].output_partitioning();
+        let partition_aware = matches!(first_input_partition, Partitioning::Hash(_, _))
+            && inputs
+                .iter()
+                .map(|plan| plan.output_partitioning())
+                .all(|partition| partition == first_input_partition);
+
         UnionExec {
             inputs,
             metrics: ExecutionPlanMetricsSet::new(),
             schema,
+            partition_aware,
         }
     }
 
@@ -101,29 +191,67 @@ impl ExecutionPlan for UnionExec {
         self.schema.clone()
     }
 
+    /// Specifies whether this plan generates an infinite stream of records.
+    /// If the plan does not support pipelining, but it its input(s) are
+    /// infinite, returns an error to indicate this.
+    fn unbounded_output(&self, children: &[bool]) -> Result<bool> {
+        Ok(children.iter().any(|x| *x))
+    }
+
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         self.inputs.clone()
     }
 
     /// Output of the union is the combination of all output partitions of the inputs
     fn output_partitioning(&self) -> Partitioning {
-        // Sums all the output partitions
-        let num_partitions = self
-            .inputs
-            .iter()
-            .map(|plan| plan.output_partitioning().partition_count())
-            .sum();
-        // TODO: this loses partitioning info in case of same partitioning scheme (for example `Partitioning::Hash`)
-        // https://issues.apache.org/jira/browse/ARROW-11991
-        Partitioning::UnknownPartitioning(num_partitions)
+        if self.partition_aware {
+            self.inputs[0].output_partitioning()
+        } else {
+            // Output the combination of all output partitions of the inputs if the Union is not partition aware
+            let num_partitions = self
+                .inputs
+                .iter()
+                .map(|plan| plan.output_partitioning().partition_count())
+                .sum();
+
+            Partitioning::UnknownPartitioning(num_partitions)
+        }
     }
 
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
+        // If the Union is partition aware, there is no output ordering.
+        // Otherwise, the output ordering is the "meet" of its input orderings.
+        // The meet is the finest ordering that satisfied by all the input
+        // orderings, see https://en.wikipedia.org/wiki/Join_and_meet.
+        if self.partition_aware {
+            return None;
+        }
+        get_meet_of_orderings(&self.inputs)
     }
 
-    fn relies_on_input_order(&self) -> bool {
-        false
+    fn maintains_input_order(&self) -> Vec<bool> {
+        // If the Union has an output ordering, it maintains at least one
+        // child's ordering (i.e. the meet).
+        // For instance, assume that the first child is SortExpr('a','b','c'),
+        // the second child is SortExpr('a','b') and the third child is
+        // SortExpr('a','b'). The output ordering would be SortExpr('a','b'),
+        // which is the "meet" of all input orderings. In this example, this
+        // function will return vec![false, true, true], indicating that we
+        // preserve the orderings for the 2nd and the 3rd children.
+        if let Some(output_ordering) = self.output_ordering() {
+            self.inputs()
+                .iter()
+                .map(|child| {
+                    if let Some(child_ordering) = child.output_ordering() {
+                        output_ordering.len() == child_ordering.len()
+                    } else {
+                        false
+                    }
+                })
+                .collect()
+        } else {
+            vec![false; self.inputs().len()]
+        }
     }
 
     fn with_new_children(
@@ -145,23 +273,41 @@ impl ExecutionPlan for UnionExec {
         let elapsed_compute = baseline_metrics.elapsed_compute().clone();
         let _timer = elapsed_compute.timer(); // record on drop
 
-        // find partition to execute
-        for input in self.inputs.iter() {
-            // Calculate whether partition belongs to the current partition
-            if partition < input.output_partitioning().partition_count() {
-                let stream = input.execute(partition, context)?;
-                debug!("Found a Union partition to execute");
+        if self.partition_aware {
+            let mut input_stream_vec = vec![];
+            for input in self.inputs.iter() {
+                if partition < input.output_partitioning().partition_count() {
+                    input_stream_vec.push(input.execute(partition, context.clone())?);
+                } else {
+                    // Do not find a partition to execute
+                    break;
+                }
+            }
+            if input_stream_vec.len() == self.inputs.len() {
+                let stream = Box::pin(CombinedRecordBatchStream::new(
+                    self.schema(),
+                    input_stream_vec,
+                ));
                 return Ok(Box::pin(ObservedStream::new(stream, baseline_metrics)));
-            } else {
-                partition -= input.output_partitioning().partition_count();
+            }
+        } else {
+            // find partition to execute
+            for input in self.inputs.iter() {
+                // Calculate whether partition belongs to the current partition
+                if partition < input.output_partitioning().partition_count() {
+                    let stream = input.execute(partition, context)?;
+                    debug!("Found a Union partition to execute");
+                    return Ok(Box::pin(ObservedStream::new(stream, baseline_metrics)));
+                } else {
+                    partition -= input.output_partitioning().partition_count();
+                }
             }
         }
 
-        debug!("Error in Union: Partition {} not found", partition);
+        warn!("Error in Union: Partition {} not found", partition);
 
         Err(crate::error::DataFusionError::Execution(format!(
-            "Partition {} not found in Union",
-            partition
+            "Partition {partition} not found in Union"
         )))
     }
 
@@ -194,6 +340,73 @@ impl ExecutionPlan for UnionExec {
     }
 }
 
+/// CombinedRecordBatchStream can be used to combine a Vec of SendableRecordBatchStreams into one
+pub struct CombinedRecordBatchStream {
+    /// Schema wrapped by Arc
+    schema: SchemaRef,
+    /// Stream entries
+    entries: Vec<SendableRecordBatchStream>,
+}
+
+impl CombinedRecordBatchStream {
+    /// Create an CombinedRecordBatchStream
+    pub fn new(schema: SchemaRef, entries: Vec<SendableRecordBatchStream>) -> Self {
+        Self { schema, entries }
+    }
+}
+
+impl RecordBatchStream for CombinedRecordBatchStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+impl Stream for CombinedRecordBatchStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        use Poll::*;
+
+        let start = thread_rng_n(self.entries.len() as u32) as usize;
+        let mut idx = start;
+
+        for _ in 0..self.entries.len() {
+            let stream = self.entries.get_mut(idx).unwrap();
+
+            match Pin::new(stream).poll_next(cx) {
+                Ready(Some(val)) => return Ready(Some(val)),
+                Ready(None) => {
+                    // Remove the entry
+                    self.entries.swap_remove(idx);
+
+                    // Check if this was the last entry, if so the cursor needs
+                    // to wrap
+                    if idx == self.entries.len() {
+                        idx = 0;
+                    } else if idx < start && start <= self.entries.len() {
+                        // The stream being swapped into the current index has
+                        // already been polled, so skip it.
+                        idx = idx.wrapping_add(1) % self.entries.len();
+                    }
+                }
+                Pending => {
+                    idx = idx.wrapping_add(1) % self.entries.len();
+                }
+            }
+        }
+
+        // If the map is empty, then the stream is complete.
+        if self.entries.is_empty() {
+            Ready(None)
+        } else {
+            Pending
+        }
+    }
+}
+
 /// Stream wrapper that records `BaselineMetrics` for a particular
 /// partition
 struct ObservedStream {
@@ -217,7 +430,7 @@ impl RecordBatchStream for ObservedStream {
 }
 
 impl futures::Stream for ObservedStream {
-    type Item = arrow::error::Result<RecordBatch>;
+    type Item = Result<RecordBatch>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,

@@ -18,14 +18,13 @@
 //! Optimizer rule to replace TableScan references
 //! such as DataFrames and Views and inlines the LogicalPlan
 //! to support further optimization
+use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_common::Result;
-use datafusion_expr::{
-    logical_plan::LogicalPlan, utils::from_plan, Expr, LogicalPlanBuilder, TableScan,
-};
+use datafusion_expr::{logical_plan::LogicalPlan, Expr, LogicalPlanBuilder, TableScan};
 
 /// Optimization rule that inlines TableScan that provide a [LogicalPlan]
-/// ([DataFrame] / [ViewTable])
+/// (DataFrame / ViewTable)
 #[derive(Default)]
 pub struct InlineTableScan;
 
@@ -36,58 +35,41 @@ impl InlineTableScan {
     }
 }
 
-/// Inline
-fn inline_table_scan(plan: &LogicalPlan) -> Result<LogicalPlan> {
-    match plan {
-        // Match only on scans without filter / projection / fetch
-        // Views and DataFrames won't have those added
-        // during the early stage of planning
-        LogicalPlan::TableScan(TableScan {
-            source,
-            table_name,
-            filters,
-            fetch: None,
-            ..
-        }) if filters.is_empty() => {
-            if let Some(sub_plan) = source.get_logical_plan() {
-                // Recursively apply optimization
-                let plan = inline_table_scan(sub_plan)?;
-                let plan = LogicalPlanBuilder::from(plan).project_with_alias(
-                    vec![Expr::Wildcard],
-                    Some(table_name.to_string()),
-                )?;
-                plan.build()
-            } else {
-                // No plan available, return with table scan as is
-                Ok(plan.clone())
-            }
-        }
-
-        // Rest: Recurse
-        _ => {
-            // apply the optimization to all inputs of the plan
-            let inputs = plan.inputs();
-            let new_inputs = inputs
-                .iter()
-                .map(|plan| inline_table_scan(plan))
-                .collect::<Result<Vec<_>>>()?;
-
-            from_plan(plan, &plan.expressions(), &new_inputs)
-        }
-    }
-}
-
 impl OptimizerRule for InlineTableScan {
-    fn optimize(
+    fn try_optimize(
         &self,
         plan: &LogicalPlan,
-        _optimizer_config: &mut OptimizerConfig,
-    ) -> Result<LogicalPlan> {
-        inline_table_scan(plan)
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Option<LogicalPlan>> {
+        match plan {
+            // Match only on scans without filter / projection / fetch
+            // Views and DataFrames won't have those added
+            // during the early stage of planning
+            LogicalPlan::TableScan(TableScan {
+                source,
+                table_name,
+                filters,
+                ..
+            }) if filters.is_empty() => {
+                if let Some(sub_plan) = source.get_logical_plan() {
+                    let plan = LogicalPlanBuilder::from(sub_plan.clone())
+                        .project(vec![Expr::Wildcard])?
+                        .alias(table_name)?;
+                    Ok(Some(plan.build()?))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
     }
 
     fn name(&self) -> &str {
         "inline_table_scan"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
     }
 }
 
@@ -98,7 +80,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_expr::{col, lit, LogicalPlan, LogicalPlanBuilder, TableSource};
 
-    use crate::{inline_table_scan::InlineTableScan, OptimizerConfig, OptimizerRule};
+    use crate::inline_table_scan::InlineTableScan;
+    use crate::test::assert_optimized_plan_eq;
 
     pub struct RawTableSource {}
 
@@ -123,6 +106,7 @@ mod tests {
     pub struct CustomSource {
         plan: LogicalPlan,
     }
+
     impl CustomSource {
         fn new() -> Self {
             Self {
@@ -133,6 +117,7 @@ mod tests {
             }
         }
     }
+
     impl TableSource for CustomSource {
         fn as_any(&self) -> &dyn std::any::Any {
             self
@@ -156,25 +141,18 @@ mod tests {
     }
 
     #[test]
-    fn inline_table_scan() {
-        let rule = InlineTableScan::new();
+    fn inline_table_scan() -> datafusion_common::Result<()> {
+        let scan = LogicalPlanBuilder::scan(
+            "x".to_string(),
+            Arc::new(CustomSource::new()),
+            None,
+        )?;
+        let plan = scan.filter(col("x.a").eq(lit(1)))?.build()?;
+        let expected = "Filter: x.a = Int32(1)\
+        \n  SubqueryAlias: x\
+        \n    Projection: y.a\
+        \n      TableScan: y";
 
-        let source = Arc::new(CustomSource::new());
-
-        let scan = LogicalPlanBuilder::scan("x".to_string(), source, None).unwrap();
-
-        let plan = scan.filter(col("x.a").eq(lit(1))).unwrap().build().unwrap();
-
-        let optimized_plan = rule
-            .optimize(&plan, &mut OptimizerConfig::new())
-            .expect("failed to optimize plan");
-        let formatted_plan = format!("{:?}", optimized_plan);
-        let expected = "\
-        Filter: x.a = Int32(1)\
-        \n  Projection: y.a, alias=x\
-        \n    TableScan: y";
-
-        assert_eq!(formatted_plan, expected);
-        assert_eq!(plan.schema(), optimized_plan.schema());
+        assert_optimized_plan_eq(Arc::new(InlineTableScan::new()), &plan, expected)
     }
 }

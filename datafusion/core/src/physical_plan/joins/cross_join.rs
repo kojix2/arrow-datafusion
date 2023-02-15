@@ -23,22 +23,25 @@ use futures::{Stream, TryStreamExt};
 use std::{any::Any, sync::Arc, task::Poll};
 
 use arrow::datatypes::{Schema, SchemaRef};
-use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
 
 use crate::execution::context::TaskContext;
 use crate::physical_plan::{
     coalesce_batches::concat_batches, coalesce_partitions::CoalescePartitionsExec,
-    ColumnStatistics, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
+    ColumnStatistics, DisplayFormatType, Distribution, EquivalenceProperties,
+    ExecutionPlan, Partitioning, PhysicalSortExpr, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
 };
 use crate::{error::Result, scalar::ScalarValue};
 use async_trait::async_trait;
-use datafusion_physical_expr::PhysicalSortExpr;
+use datafusion_common::DataFusionError;
 use log::debug;
 use std::time::Instant;
 
-use super::utils::{check_join_is_valid, OnceAsync, OnceFut};
+use super::utils::{
+    adjust_right_output_partitioning, cross_join_equivalence_properties, OnceAsync,
+    OnceFut,
+};
 
 /// Data of the left side
 type JoinLeftData = RecordBatch;
@@ -48,9 +51,9 @@ type JoinLeftData = RecordBatch;
 #[derive(Debug)]
 pub struct CrossJoinExec {
     /// left (build) side which gets loaded in memory
-    left: Arc<dyn ExecutionPlan>,
+    pub(crate) left: Arc<dyn ExecutionPlan>,
     /// right (probe) side which are combined with left side
-    right: Arc<dyn ExecutionPlan>,
+    pub(crate) right: Arc<dyn ExecutionPlan>,
     /// The schema once the join is applied
     schema: SchemaRef,
     /// Build-side data
@@ -58,34 +61,25 @@ pub struct CrossJoinExec {
 }
 
 impl CrossJoinExec {
-    /// Tries to create a new [CrossJoinExec].
-    /// # Error
-    /// This function errors when left and right schema's can't be combined
-    pub fn try_new(
-        left: Arc<dyn ExecutionPlan>,
-        right: Arc<dyn ExecutionPlan>,
-    ) -> Result<Self> {
-        let left_schema = left.schema();
-        let right_schema = right.schema();
-        check_join_is_valid(&left_schema, &right_schema, &[])?;
-
-        let left_schema = left.schema();
-        let left_fields = left_schema.fields().iter();
-        let right_schema = right.schema();
-
-        let right_fields = right_schema.fields().iter();
-
+    /// Create a new [CrossJoinExec].
+    pub fn new(left: Arc<dyn ExecutionPlan>, right: Arc<dyn ExecutionPlan>) -> Self {
         // left then right
-        let all_columns = left_fields.chain(right_fields).cloned().collect();
+        let all_columns = {
+            let left_schema = left.schema();
+            let right_schema = right.schema();
+            let left_fields = left_schema.fields().iter();
+            let right_fields = right_schema.fields().iter();
+            left_fields.chain(right_fields).cloned().collect()
+        };
 
         let schema = Arc::new(Schema::new(all_columns));
 
-        Ok(CrossJoinExec {
+        CrossJoinExec {
             left,
             right,
             schema,
             left_fut: Default::default(),
-        })
+        }
     }
 
     /// left (build) side which gets loaded in memory
@@ -107,7 +101,13 @@ async fn load_left_input(
     let start = Instant::now();
 
     // merge all left parts into a single stream
-    let merge = CoalescePartitionsExec::new(left.clone());
+    let merge = {
+        if left.output_partitioning().partition_count() != 1 {
+            Arc::new(CoalescePartitionsExec::new(left.clone()))
+        } else {
+            left.clone()
+        }
+    };
     let stream = merge.execute(0, context)?;
 
     // Load all batches and count the rows
@@ -143,26 +143,59 @@ impl ExecutionPlan for CrossJoinExec {
         vec![self.left.clone(), self.right.clone()]
     }
 
+    /// Specifies whether this plan generates an infinite stream of records.
+    /// If the plan does not support pipelining, but it its input(s) are
+    /// infinite, returns an error to indicate this.    
+    fn unbounded_output(&self, children: &[bool]) -> Result<bool> {
+        if children[0] || children[1] {
+            Err(DataFusionError::Plan(
+                "Cross Join Error: Cross join is not supported for the unbounded inputs."
+                    .to_string(),
+            ))
+        } else {
+            Ok(false)
+        }
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(CrossJoinExec::try_new(
+        Ok(Arc::new(CrossJoinExec::new(
             children[0].clone(),
             children[1].clone(),
-        )?))
+        )))
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![
+            Distribution::SinglePartition,
+            Distribution::UnspecifiedDistribution,
+        ]
+    }
+
+    // TODO optimize CrossJoin implementation to generate M * N partitions
     fn output_partitioning(&self) -> Partitioning {
-        self.right.output_partitioning()
+        let left_columns_len = self.left.schema().fields.len();
+        adjust_right_output_partitioning(
+            self.right.output_partitioning(),
+            left_columns_len,
+        )
     }
 
+    // TODO check the output ordering of CrossJoin
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
         None
     }
 
-    fn relies_on_input_order(&self) -> bool {
-        false
+    fn equivalence_properties(&self) -> EquivalenceProperties {
+        let left_columns_len = self.left.schema().fields.len();
+        cross_join_equivalence_properties(
+            self.left.equivalence_properties(),
+            self.right.equivalence_properties(),
+            left_columns_len,
+            self.schema(),
+        )
     }
 
     fn execute(
@@ -311,7 +344,7 @@ fn build_batch(
     batch: &RecordBatch,
     left_data: &RecordBatch,
     schema: &Schema,
-) -> ArrowResult<RecordBatch> {
+) -> Result<RecordBatch> {
     // Repeat value on the left n times
     let arrays = left_data
         .columns()
@@ -330,11 +363,12 @@ fn build_batch(
             .cloned()
             .collect(),
     )
+    .map_err(Into::into)
 }
 
 #[async_trait]
 impl Stream for CrossJoinStream {
-    type Item = ArrowResult<RecordBatch>;
+    type Item = Result<RecordBatch>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -350,7 +384,7 @@ impl CrossJoinStream {
     fn poll_next_impl(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<ArrowResult<RecordBatch>>> {
+    ) -> std::task::Poll<Option<Result<RecordBatch>>> {
         let left_data = match ready!(self.left_fut.get(cx)) {
             Ok(left_data) => left_data,
             Err(e) => return Poll::Ready(Some(Err(e))),

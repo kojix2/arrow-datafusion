@@ -61,7 +61,7 @@ async fn csv_query_with_negated_predicate() -> Result<()> {
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
         "+-----------------+",
-        "| COUNT(UInt8(1)) |",
+        "| COUNT(Int64(1)) |",
         "+-----------------+",
         "| 21              |",
         "+-----------------+",
@@ -78,7 +78,7 @@ async fn csv_query_with_is_not_null_predicate() -> Result<()> {
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
         "+-----------------+",
-        "| COUNT(UInt8(1)) |",
+        "| COUNT(Int64(1)) |",
         "+-----------------+",
         "| 100             |",
         "+-----------------+",
@@ -95,7 +95,7 @@ async fn csv_query_with_is_null_predicate() -> Result<()> {
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
         "+-----------------+",
-        "| COUNT(UInt8(1)) |",
+        "| COUNT(Int64(1)) |",
         "+-----------------+",
         "| 0               |",
         "+-----------------+",
@@ -428,8 +428,101 @@ async fn csv_in_set_test() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore]
-// https://github.com/apache/arrow-datafusion/issues/3936
+async fn in_list_string_dictionaries() -> Result<()> {
+    // let input = vec![Some("foo"), Some("bar"), None, Some("fazzz")]
+    let input = vec![Some("foo"), Some("bar"), Some("fazzz")]
+        .into_iter()
+        .collect::<DictionaryArray<Int32Type>>();
+
+    let batch = RecordBatch::try_from_iter(vec![("c1", Arc::new(input) as _)]).unwrap();
+
+    let ctx = SessionContext::new();
+    ctx.register_batch("test", batch)?;
+
+    let sql = "SELECT * FROM test WHERE c1 IN ('Bar')";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec!["++", "++"];
+    assert_batches_eq!(expected, &actual);
+
+    let sql = "SELECT * FROM test WHERE c1 IN ('foo')";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec!["+-----+", "| c1  |", "+-----+", "| foo |", "+-----+"];
+    assert_batches_eq!(expected, &actual);
+
+    let sql = "SELECT * FROM test WHERE c1 IN ('bar', 'foo')";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-----+", "| c1  |", "+-----+", "| foo |", "| bar |", "+-----+",
+    ];
+    assert_batches_eq!(expected, &actual);
+
+    let sql = "SELECT * FROM test WHERE c1 IN ('Bar', 'foo')";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec!["+-----+", "| c1  |", "+-----+", "| foo |", "+-----+"];
+    assert_batches_eq!(expected, &actual);
+
+    let sql = "SELECT * FROM test WHERE c1 IN ('foo', 'Bar', 'fazzz')";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| c1    |",
+        "+-------+",
+        "| foo   |",
+        "| fazzz |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_list_string_dictionaries_with_null() -> Result<()> {
+    let input = vec![Some("foo"), Some("bar"), None, Some("fazzz")]
+        .into_iter()
+        .collect::<DictionaryArray<Int32Type>>();
+
+    let batch = RecordBatch::try_from_iter(vec![("c1", Arc::new(input) as _)]).unwrap();
+
+    let ctx = SessionContext::new();
+    ctx.register_batch("test", batch)?;
+
+    let sql = "SELECT * FROM test WHERE c1 IN ('Bar')";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec!["++", "++"];
+    assert_batches_eq!(expected, &actual);
+
+    let sql = "SELECT * FROM test WHERE c1 IN ('foo')";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec!["+-----+", "| c1  |", "+-----+", "| foo |", "+-----+"];
+    assert_batches_eq!(expected, &actual);
+
+    let sql = "SELECT * FROM test WHERE c1 IN ('bar', 'foo')";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-----+", "| c1  |", "+-----+", "| foo |", "| bar |", "+-----+",
+    ];
+    assert_batches_eq!(expected, &actual);
+
+    let sql = "SELECT * FROM test WHERE c1 IN ('Bar', 'foo')";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec!["+-----+", "| c1  |", "+-----+", "| foo |", "+-----+"];
+    assert_batches_eq!(expected, &actual);
+
+    let sql = "SELECT * FROM test WHERE c1 IN ('foo', 'Bar', 'fazzz')";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| c1    |",
+        "+-------+",
+        "| foo   |",
+        "| fazzz |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &actual);
+    Ok(())
+}
+
+#[tokio::test]
 async fn in_set_string_dictionaries() -> Result<()> {
     let input = vec![Some("foo"), Some("bar"), None, Some("fazzz")]
         .into_iter()
@@ -440,7 +533,7 @@ async fn in_set_string_dictionaries() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_batch("test", batch)?;
 
-    let sql = "SELECT * FROM test WHERE c1 IN ('foo', 'Bar', 'fazz')";
+    let sql = "SELECT * FROM test WHERE c1 IN ('foo', 'Bar', 'fazzz')";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
         "+-------+",
@@ -456,8 +549,7 @@ async fn in_set_string_dictionaries() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore]
-// https://github.com/apache/arrow-datafusion/issues/3635
+// Test issue: https://github.com/apache/arrow-datafusion/issues/3635
 async fn multiple_or_predicates() -> Result<()> {
     let ctx = SessionContext::new();
     register_tpch_csv(&ctx, "lineitem").await?;
@@ -488,34 +580,26 @@ async fn multiple_or_predicates() -> Result<()> {
             and l_quantity >= 20 and l_quantity <= 20 + 10
             and p_size between 1 and 15
         )";
-    let msg = format!("Creating logical plan for '{}'", sql);
-    let plan = ctx.create_logical_plan(sql).expect(&msg);
-    let state = ctx.state();
-    let plan = state.optimize(&plan)?;
+    let msg = format!("Creating logical plan for '{sql}'");
+    let dataframe = ctx.sql(sql).await.expect(&msg);
+    let plan = dataframe.into_optimized_plan().unwrap();
     // Note that we expect `part.p_partkey = lineitem.l_partkey` to have been
     // factored out and appear only once in the following plan
     let expected = vec![
         "Explain [plan_type:Utf8, plan:Utf8]",
-        "  Projection: #lineitem.l_partkey [l_partkey:Int64]",
-        "    Projection: #part.p_size >= Int32(1) AS #part.p_size >= Int32(1)Int32(1)#part.p_size, #lineitem.l_partkey, #lineitem.l_quantity, #part.p_brand, #part.p_size [#part.p_size >= Int32(1)Int32(1)#part.p_size:Boolean;N, l_partkey:Int64, l_quantity:Decimal128(15, 2), p_brand:Utf8, p_size:Int32]",
-        "      Filter: #part.p_brand = Utf8(\"Brand#12\") AND #lineitem.l_quantity >= Decimal128(Some(100),15,2) AND #lineitem.l_quantity <= Decimal128(Some(1100),15,2) AND #part.p_size <= Int32(5) OR #part.p_brand = Utf8(\"Brand#23\") AND #lineitem.l_quantity >= Decimal128(Some(1000),15,2) AND #lineitem.l_quantity <= Decimal128(Some(2000),15,2) AND #part.p_size <= Int32(10) OR #part.p_brand = Utf8(\"Brand#34\") AND #lineitem.l_quantity >= Decimal128(Some(2000),15,2) AND #lineitem.l_quantity <= Decimal128(Some(3000),15,2) AND #part.p_size <= Int32(15) [l_partkey:Int64, l_quantity:Decimal128(15, 2), p_partkey:Int64, p_brand:Utf8, p_size:Int32]",
-        "        Inner Join: #lineitem.l_partkey = #part.p_partkey [l_partkey:Int64, l_quantity:Decimal128(15, 2), p_partkey:Int64, p_brand:Utf8, p_size:Int32]",
-        "          Filter: #lineitem.l_quantity >= Decimal128(Some(100),15,2) AND #lineitem.l_quantity <= Decimal128(Some(1100),15,2) OR #lineitem.l_quantity >= Decimal128(Some(1000),15,2) AND #lineitem.l_quantity <= Decimal128(Some(2000),15,2) OR #lineitem.l_quantity >= Decimal128(Some(2000),15,2) AND #lineitem.l_quantity <= Decimal128(Some(3000),15,2) [l_partkey:Int64, l_quantity:Decimal128(15, 2)]",
-        "            TableScan: lineitem projection=[l_partkey, l_quantity], partial_filters=[#lineitem.l_quantity >= Decimal128(Some(100),15,2) AND #lineitem.l_quantity <= Decimal128(Some(1100),15,2) OR #lineitem.l_quantity >= Decimal128(Some(1000),15,2) AND #lineitem.l_quantity <= Decimal128(Some(2000),15,2) OR #lineitem.l_quantity >= Decimal128(Some(2000),15,2) AND #lineitem.l_quantity <= Decimal128(Some(3000),15,2)] [l_partkey:Int64, l_quantity:Decimal128(15, 2)]",
-        "          Filter: #part.p_size >= Int32(1) AND #part.p_brand = Utf8(\"Brand#12\") AND #part.p_size <= Int32(5) OR #part.p_brand = Utf8(\"Brand#23\") AND #part.p_size <= Int32(10) OR #part.p_brand = Utf8(\"Brand#34\") AND #part.p_size <= Int32(15) [p_partkey:Int64, p_brand:Utf8, p_size:Int32]",
-        "            TableScan: part projection=[p_partkey, p_brand, p_size], partial_filters=[#part.p_size >= Int32(1), #part.p_brand = Utf8(\"Brand#12\") AND #part.p_size <= Int32(5) OR #part.p_brand = Utf8(\"Brand#23\") AND #part.p_size <= Int32(10) OR #part.p_brand = Utf8(\"Brand#34\") AND #part.p_size <= Int32(15)] [p_partkey:Int64, p_brand:Utf8, p_size:Int32]",
         "  Projection: lineitem.l_partkey [l_partkey:Int64]",
-        "    Filter: part.p_brand = Utf8(\"Brand#12\") AND lineitem.l_quantity >= Decimal128(Some(100),15,2) AND lineitem.l_quantity <= Decimal128(Some(1100),15,2) AND CAST(part.p_size AS Int64) BETWEEN Int64(1) AND Int64(5) OR part.p_brand = Utf8(\"Brand#23\") AND lineitem.l_quantity >= Decimal128(Some(1000),15,2) AND lineitem.l_quantity <= Decimal128(Some(2000),15,2) AND CAST(part.p_size AS Int64) BETWEEN Int64(1) AND Int64(10) OR part.p_brand = Utf8(\"Brand#34\") AND lineitem.l_quantity >= Decimal128(Some(2000),15,2) AND lineitem.l_quantity <= Decimal128(Some(3000),15,2) AND CAST(part.p_size AS Int64) BETWEEN Int64(1) AND Int64(15) [l_partkey:Int64, l_quantity:Decimal128(15, 2), p_partkey:Int64, p_brand:Utf8, p_size:Int32]",
+        "    Filter: part.p_brand = Utf8(\"Brand#12\") AND lineitem.l_quantity >= Decimal128(Some(100),15,2) AND lineitem.l_quantity <= Decimal128(Some(1100),15,2) AND part.p_size <= Int32(5) OR part.p_brand = Utf8(\"Brand#23\") AND lineitem.l_quantity >= Decimal128(Some(1000),15,2) AND lineitem.l_quantity <= Decimal128(Some(2000),15,2) AND part.p_size <= Int32(10) OR part.p_brand = Utf8(\"Brand#34\") AND lineitem.l_quantity >= Decimal128(Some(2000),15,2) AND lineitem.l_quantity <= Decimal128(Some(3000),15,2) AND part.p_size <= Int32(15) [l_partkey:Int64, l_quantity:Decimal128(15, 2), p_partkey:Int64, p_brand:Utf8, p_size:Int32]",
         "      Inner Join: lineitem.l_partkey = part.p_partkey [l_partkey:Int64, l_quantity:Decimal128(15, 2), p_partkey:Int64, p_brand:Utf8, p_size:Int32]",
-        "        TableScan: lineitem projection=[l_partkey, l_quantity] [l_partkey:Int64, l_quantity:Decimal128(15, 2)]",
-        "        TableScan: part projection=[p_partkey, p_brand, p_size] [p_partkey:Int64, p_brand:Utf8, p_size:Int32]",
+        "        Filter: lineitem.l_quantity >= Decimal128(Some(100),15,2) AND lineitem.l_quantity <= Decimal128(Some(1100),15,2) OR lineitem.l_quantity >= Decimal128(Some(1000),15,2) AND lineitem.l_quantity <= Decimal128(Some(2000),15,2) OR lineitem.l_quantity >= Decimal128(Some(2000),15,2) AND lineitem.l_quantity <= Decimal128(Some(3000),15,2) [l_partkey:Int64, l_quantity:Decimal128(15, 2)]",
+        "          TableScan: lineitem projection=[l_partkey, l_quantity], partial_filters=[lineitem.l_quantity >= Decimal128(Some(100),15,2) AND lineitem.l_quantity <= Decimal128(Some(1100),15,2) OR lineitem.l_quantity >= Decimal128(Some(1000),15,2) AND lineitem.l_quantity <= Decimal128(Some(2000),15,2) OR lineitem.l_quantity >= Decimal128(Some(2000),15,2) AND lineitem.l_quantity <= Decimal128(Some(3000),15,2)] [l_partkey:Int64, l_quantity:Decimal128(15, 2)]",
+        "        Filter: (part.p_brand = Utf8(\"Brand#12\") AND part.p_size <= Int32(5) OR part.p_brand = Utf8(\"Brand#23\") AND part.p_size <= Int32(10) OR part.p_brand = Utf8(\"Brand#34\") AND part.p_size <= Int32(15)) AND part.p_size >= Int32(1) [p_partkey:Int64, p_brand:Utf8, p_size:Int32]",
+        "          TableScan: part projection=[p_partkey, p_brand, p_size], partial_filters=[part.p_size >= Int32(1), part.p_brand = Utf8(\"Brand#12\") AND part.p_size <= Int32(5) OR part.p_brand = Utf8(\"Brand#23\") AND part.p_size <= Int32(10) OR part.p_brand = Utf8(\"Brand#34\") AND part.p_size <= Int32(15)] [p_partkey:Int64, p_brand:Utf8, p_size:Int32]",
     ];
     let formatted = plan.display_indent_schema().to_string();
     let actual: Vec<&str> = formatted.trim().lines().collect();
     assert_eq!(
         expected, actual,
-        "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
-        expected, actual
+        "\n\nexpected:\n\n{expected:#?}\nactual:\n\n{actual:#?}\n\n"
     );
     Ok(())
 }
@@ -556,10 +640,8 @@ where
         group by p_partkey
         ;"#;
 
-    let msg = format!("Creating logical plan for '{}'", sql);
-    let plan = ctx.create_logical_plan(sql).expect(&msg);
-    let state = ctx.state();
-    let plan = state.optimize(&plan)?;
+    let dataframe = ctx.sql(sql).await.unwrap();
+    let plan = dataframe.into_optimized_plan().unwrap();
     let formatted = plan.display_indent_schema().to_string();
     let actual: Vec<&str> = formatted.trim().lines().collect();
     let expected =vec![
@@ -575,8 +657,7 @@ where
 
     assert_eq!(
         expected, actual,
-        "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
-        expected, actual
+        "\n\nexpected:\n\n{expected:#?}\nactual:\n\n{actual:#?}\n\n"
     );
 
     // assert data

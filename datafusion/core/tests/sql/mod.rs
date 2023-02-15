@@ -25,6 +25,7 @@ use arrow::{
 use chrono::prelude::*;
 use chrono::Duration;
 
+use datafusion::config::ConfigOptions;
 use datafusion::datasource::TableProvider;
 use datafusion::from_slice::FromSlice;
 use datafusion::logical_expr::{Aggregate, LogicalPlan, Projection, TableScan};
@@ -40,6 +41,7 @@ use datafusion::{
     physical_plan::ColumnarValue,
 };
 use datafusion::{execution::context::SessionContext, physical_plan::displayable};
+use datafusion_common::cast::as_float64_array;
 use datafusion_common::{assert_contains, assert_not_contains};
 use datafusion_expr::Volatility;
 use object_store::path::Path;
@@ -102,13 +104,12 @@ pub mod union;
 pub mod wildcard;
 pub mod window;
 
-pub mod arrow_typeof;
-pub mod decimal;
 pub mod explain;
 pub mod idenfifers;
 pub mod information_schema;
 pub mod parquet_schema;
 pub mod partitioned_csv;
+pub mod set_variable;
 pub mod subqueries;
 #[cfg(feature = "unicode_expressions")]
 pub mod unicode;
@@ -129,14 +130,13 @@ where
             if l.is_nan() || r.is_nan() {
                 assert!(l.is_nan() && r.is_nan());
             } else if (l - r).abs() > 2.0 * f64::EPSILON {
-                panic!("{} != {}", l, r)
+                panic!("{l} != {r}")
             }
         });
 }
 
-#[allow(clippy::unnecessary_wraps)]
-fn create_ctx() -> Result<SessionContext> {
-    let mut ctx = SessionContext::new();
+fn create_ctx() -> SessionContext {
+    let ctx = SessionContext::new();
 
     // register a custom UDF
     ctx.register_udf(create_udf(
@@ -147,17 +147,13 @@ fn create_ctx() -> Result<SessionContext> {
         Arc::new(custom_sqrt),
     ));
 
-    Ok(ctx)
+    ctx
 }
 
 fn custom_sqrt(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     let arg = &args[0];
     if let ColumnarValue::Array(v) = arg {
-        let input = v
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("cast failed");
-
+        let input = as_float64_array(v).expect("cast failed");
         let array: Float64Array = input.iter().map(|v| v.map(|x| x.sqrt())).collect();
         Ok(ColumnarValue::Array(Arc::new(array)))
     } else {
@@ -181,8 +177,17 @@ fn create_case_context() -> Result<SessionContext> {
     Ok(ctx)
 }
 
-fn create_join_context(column_left: &str, column_right: &str) -> Result<SessionContext> {
-    let ctx = SessionContext::new();
+fn create_join_context(
+    column_left: &str,
+    column_right: &str,
+    repartition_joins: bool,
+) -> Result<SessionContext> {
+    let ctx = SessionContext::with_config(
+        SessionConfig::new()
+            .with_repartition_joins(repartition_joins)
+            .with_target_partitions(2)
+            .with_batch_size(4096),
+    );
 
     let t1_schema = Arc::new(Schema::new(vec![
         Field::new(column_left, DataType::UInt32, true),
@@ -192,14 +197,14 @@ fn create_join_context(column_left: &str, column_right: &str) -> Result<SessionC
     let t1_data = RecordBatch::try_new(
         t1_schema,
         vec![
-            Arc::new(UInt32Array::from_slice(&[11, 22, 33, 44])),
+            Arc::new(UInt32Array::from_slice([11, 22, 33, 44])),
             Arc::new(StringArray::from(vec![
                 Some("a"),
                 Some("b"),
                 Some("c"),
                 Some("d"),
             ])),
-            Arc::new(UInt32Array::from_slice(&[1, 2, 3, 4])),
+            Arc::new(UInt32Array::from_slice([1, 2, 3, 4])),
         ],
     )?;
     ctx.register_batch("t1", t1_data)?;
@@ -212,14 +217,143 @@ fn create_join_context(column_left: &str, column_right: &str) -> Result<SessionC
     let t2_data = RecordBatch::try_new(
         t2_schema,
         vec![
-            Arc::new(UInt32Array::from_slice(&[11, 22, 44, 55])),
+            Arc::new(UInt32Array::from_slice([11, 22, 44, 55])),
             Arc::new(StringArray::from(vec![
                 Some("z"),
                 Some("y"),
                 Some("x"),
                 Some("w"),
             ])),
-            Arc::new(UInt32Array::from_slice(&[3, 1, 3, 3])),
+            Arc::new(UInt32Array::from_slice([3, 1, 3, 3])),
+        ],
+    )?;
+    ctx.register_batch("t2", t2_data)?;
+
+    Ok(ctx)
+}
+
+fn create_left_semi_anti_join_context_with_null_ids(
+    column_left: &str,
+    column_right: &str,
+    repartition_joins: bool,
+) -> Result<SessionContext> {
+    let ctx = SessionContext::with_config(
+        SessionConfig::new()
+            .with_repartition_joins(repartition_joins)
+            .with_target_partitions(2)
+            .with_batch_size(4096),
+    );
+
+    let t1_schema = Arc::new(Schema::new(vec![
+        Field::new(column_left, DataType::UInt32, true),
+        Field::new("t1_name", DataType::Utf8, true),
+        Field::new("t1_int", DataType::UInt32, true),
+    ]));
+    let t1_data = RecordBatch::try_new(
+        t1_schema,
+        vec![
+            Arc::new(UInt32Array::from(vec![
+                Some(11),
+                Some(11),
+                Some(22),
+                Some(33),
+                Some(44),
+                None,
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("a"),
+                Some("b"),
+                Some("c"),
+                Some("d"),
+                Some("e"),
+            ])),
+            Arc::new(UInt32Array::from_slice([1, 1, 2, 3, 4, 0])),
+        ],
+    )?;
+    ctx.register_batch("t1", t1_data)?;
+
+    let t2_schema = Arc::new(Schema::new(vec![
+        Field::new(column_right, DataType::UInt32, true),
+        Field::new("t2_name", DataType::Utf8, true),
+        Field::new("t2_int", DataType::UInt32, true),
+    ]));
+    let t2_data = RecordBatch::try_new(
+        t2_schema,
+        vec![
+            Arc::new(UInt32Array::from(vec![
+                Some(11),
+                Some(11),
+                Some(22),
+                Some(44),
+                Some(55),
+                None,
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("z"),
+                Some("z"),
+                Some("y"),
+                Some("x"),
+                Some("w"),
+                Some("v"),
+            ])),
+            Arc::new(UInt32Array::from_slice([3, 3, 1, 3, 3, 0])),
+        ],
+    )?;
+    ctx.register_batch("t2", t2_data)?;
+
+    Ok(ctx)
+}
+
+fn create_right_semi_anti_join_context_with_null_ids(
+    column_left: &str,
+    column_right: &str,
+    repartition_joins: bool,
+) -> Result<SessionContext> {
+    let ctx = SessionContext::with_config(
+        SessionConfig::new()
+            .with_repartition_joins(repartition_joins)
+            .with_target_partitions(2)
+            .with_batch_size(4096),
+    );
+
+    let t1_schema = Arc::new(Schema::new(vec![
+        Field::new(column_left, DataType::UInt32, true),
+        Field::new("t1_name", DataType::Utf8, true),
+        Field::new("t1_int", DataType::UInt32, true),
+    ]));
+    let t1_data = RecordBatch::try_new(
+        t1_schema,
+        vec![
+            Arc::new(UInt32Array::from(vec![
+                Some(11),
+                Some(22),
+                Some(33),
+                Some(44),
+                None,
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("b"),
+                Some("c"),
+                Some("d"),
+                Some("e"),
+            ])),
+            Arc::new(UInt32Array::from_slice([1, 2, 3, 4, 0])),
+        ],
+    )?;
+    ctx.register_batch("t1", t1_data)?;
+
+    let t2_schema = Arc::new(Schema::new(vec![
+        Field::new(column_right, DataType::UInt32, true),
+        Field::new("t2_name", DataType::Utf8, true),
+    ]));
+    // t2 data size is smaller than t1
+    let t2_data = RecordBatch::try_new(
+        t2_schema,
+        vec![
+            Arc::new(UInt32Array::from(vec![Some(11), Some(11), None])),
+            Arc::new(StringArray::from(vec![Some("a"), Some("x"), None])),
         ],
     )?;
     ctx.register_batch("t2", t2_data)?;
@@ -241,9 +375,9 @@ fn create_join_context_qualified(
     let t1_data = RecordBatch::try_new(
         t1_schema,
         vec![
-            Arc::new(UInt32Array::from_slice(&[1, 2, 3, 4])),
-            Arc::new(UInt32Array::from_slice(&[10, 20, 30, 40])),
-            Arc::new(UInt32Array::from_slice(&[50, 60, 70, 80])),
+            Arc::new(UInt32Array::from_slice([1, 2, 3, 4])),
+            Arc::new(UInt32Array::from_slice([10, 20, 30, 40])),
+            Arc::new(UInt32Array::from_slice([50, 60, 70, 80])),
         ],
     )?;
     ctx.register_batch(left_name, t1_data)?;
@@ -256,9 +390,9 @@ fn create_join_context_qualified(
     let t2_data = RecordBatch::try_new(
         t2_schema,
         vec![
-            Arc::new(UInt32Array::from_slice(&[1, 2, 9, 4])),
-            Arc::new(UInt32Array::from_slice(&[100, 200, 300, 400])),
-            Arc::new(UInt32Array::from_slice(&[500, 600, 700, 800])),
+            Arc::new(UInt32Array::from_slice([1, 2, 9, 4])),
+            Arc::new(UInt32Array::from_slice([100, 200, 300, 400])),
+            Arc::new(UInt32Array::from_slice([500, 600, 700, 800])),
         ],
     )?;
     ctx.register_batch(right_name, t2_data)?;
@@ -350,7 +484,7 @@ fn create_join_context_unbalanced(
     let t1_data = RecordBatch::try_new(
         t1_schema,
         vec![
-            Arc::new(UInt32Array::from_slice(&[11, 22, 33, 44, 77])),
+            Arc::new(UInt32Array::from_slice([11, 22, 33, 44, 77])),
             Arc::new(StringArray::from(vec![
                 Some("a"),
                 Some("b"),
@@ -369,7 +503,7 @@ fn create_join_context_unbalanced(
     let t2_data = RecordBatch::try_new(
         t2_schema,
         vec![
-            Arc::new(UInt32Array::from_slice(&[11, 22, 44, 55])),
+            Arc::new(UInt32Array::from_slice([11, 22, 44, 55])),
             Arc::new(StringArray::from(vec![
                 Some("z"),
                 Some("y"),
@@ -423,6 +557,202 @@ fn create_join_context_with_nulls() -> Result<SessionContext> {
                 Some("w"),
                 Some("u"),
             ])),
+        ],
+    )?;
+    ctx.register_batch("t2", t2_data)?;
+
+    Ok(ctx)
+}
+
+fn create_sort_merge_join_context(
+    column_left: &str,
+    column_right: &str,
+) -> Result<SessionContext> {
+    let mut config = ConfigOptions::new();
+    config.optimizer.prefer_hash_join = false;
+
+    let ctx = SessionContext::with_config(config.into());
+
+    let t1_schema = Arc::new(Schema::new(vec![
+        Field::new(column_left, DataType::UInt32, true),
+        Field::new("t1_name", DataType::Utf8, true),
+        Field::new("t1_int", DataType::UInt32, true),
+    ]));
+    let t1_data = RecordBatch::try_new(
+        t1_schema,
+        vec![
+            Arc::new(UInt32Array::from_slice([11, 22, 33, 44])),
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("b"),
+                Some("c"),
+                Some("d"),
+            ])),
+            Arc::new(UInt32Array::from_slice([1, 2, 3, 4])),
+        ],
+    )?;
+    ctx.register_batch("t1", t1_data)?;
+
+    let t2_schema = Arc::new(Schema::new(vec![
+        Field::new(column_right, DataType::UInt32, true),
+        Field::new("t2_name", DataType::Utf8, true),
+        Field::new("t2_int", DataType::UInt32, true),
+    ]));
+    let t2_data = RecordBatch::try_new(
+        t2_schema,
+        vec![
+            Arc::new(UInt32Array::from_slice([11, 22, 44, 55])),
+            Arc::new(StringArray::from(vec![
+                Some("z"),
+                Some("y"),
+                Some("x"),
+                Some("w"),
+            ])),
+            Arc::new(UInt32Array::from_slice([3, 1, 3, 3])),
+        ],
+    )?;
+    ctx.register_batch("t2", t2_data)?;
+
+    Ok(ctx)
+}
+
+fn create_sort_merge_join_datatype_context() -> Result<SessionContext> {
+    let mut config = ConfigOptions::new();
+    config.optimizer.prefer_hash_join = false;
+    config.execution.target_partitions = 2;
+    config.execution.batch_size = 4096;
+
+    let ctx = SessionContext::with_config(config.into());
+
+    let t1_schema = Schema::new(vec![
+        Field::new("c1", DataType::Date32, true),
+        Field::new("c2", DataType::Date64, true),
+        Field::new("c3", DataType::Decimal128(5, 2), true),
+        Field::new(
+            "c4",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        ),
+    ]);
+    let dict1: DictionaryArray<Int32Type> =
+        vec!["abc", "def", "ghi", "jkl"].into_iter().collect();
+    let t1_data = RecordBatch::try_new(
+        Arc::new(t1_schema),
+        vec![
+            Arc::new(Date32Array::from(vec![Some(1), Some(2), None, Some(3)])),
+            Arc::new(Date64Array::from(vec![
+                Some(86400000),
+                Some(172800000),
+                Some(259200000),
+                None,
+            ])),
+            Arc::new(
+                Decimal128Array::from_iter_values([123, 45600, 78900, -12312])
+                    .with_precision_and_scale(5, 2)
+                    .unwrap(),
+            ),
+            Arc::new(dict1),
+        ],
+    )?;
+    ctx.register_batch("t1", t1_data)?;
+
+    let t2_schema = Schema::new(vec![
+        Field::new("c1", DataType::Date32, true),
+        Field::new("c2", DataType::Date64, true),
+        Field::new("c3", DataType::Decimal128(10, 2), true),
+        Field::new(
+            "c4",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        ),
+    ]);
+    let dict2: DictionaryArray<Int32Type> =
+        vec!["abc", "abcdefg", "qwerty", ""].into_iter().collect();
+    let t2_data = RecordBatch::try_new(
+        Arc::new(t2_schema),
+        vec![
+            Arc::new(Date32Array::from(vec![Some(1), None, None, Some(3)])),
+            Arc::new(Date64Array::from(vec![
+                Some(86400000),
+                None,
+                Some(259200000),
+                None,
+            ])),
+            Arc::new(
+                Decimal128Array::from_iter_values([-12312, 10000000, 0, 78900])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+            Arc::new(dict2),
+        ],
+    )?;
+    ctx.register_batch("t2", t2_data)?;
+
+    Ok(ctx)
+}
+
+fn create_union_context() -> Result<SessionContext> {
+    let ctx = SessionContext::new();
+    let t1_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("name", DataType::UInt8, true),
+    ]));
+    let t1_data = RecordBatch::new_empty(t1_schema);
+    ctx.register_batch("t1", t1_data)?;
+
+    let t2_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt8, true),
+        Field::new("name", DataType::UInt8, true),
+    ]));
+    let t2_data = RecordBatch::new_empty(t2_schema);
+    ctx.register_batch("t2", t2_data)?;
+
+    Ok(ctx)
+}
+
+fn create_nested_loop_join_context() -> Result<SessionContext> {
+    let ctx = SessionContext::with_config(
+        SessionConfig::new()
+            .with_target_partitions(4)
+            .with_batch_size(4096),
+    );
+
+    let t1_schema = Arc::new(Schema::new(vec![
+        Field::new("t1_id", DataType::UInt32, true),
+        Field::new("t1_name", DataType::Utf8, true),
+        Field::new("t1_int", DataType::UInt32, true),
+    ]));
+    let t1_data = RecordBatch::try_new(
+        t1_schema,
+        vec![
+            Arc::new(UInt32Array::from_slice([11, 22, 33, 44])),
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("b"),
+                Some("c"),
+                Some("d"),
+            ])),
+            Arc::new(UInt32Array::from_slice([1, 2, 3, 4])),
+        ],
+    )?;
+    ctx.register_batch("t1", t1_data)?;
+
+    let t2_schema = Arc::new(Schema::new(vec![
+        Field::new("t2_id", DataType::UInt32, true),
+        Field::new("t2_name", DataType::Utf8, true),
+        Field::new("t2_int", DataType::UInt32, true),
+    ]));
+    let t2_data = RecordBatch::try_new(
+        t2_schema,
+        vec![
+            Arc::new(UInt32Array::from_slice([11, 22, 44, 55])),
+            Arc::new(StringArray::from(vec![
+                Some("z"),
+                Some("y"),
+                Some("x"),
+                Some("w"),
+            ])),
+            Arc::new(UInt32Array::from_slice([3, 1, 3, 3])),
         ],
     )?;
     ctx.register_batch("t2", t2_data)?;
@@ -526,7 +856,7 @@ async fn register_tpch_csv(ctx: &SessionContext, table: &str) -> Result<()> {
 
     ctx.register_csv(
         table,
-        format!("tests/tpch-csv/{}.csv", table).as_str(),
+        format!("tests/tpch-csv/{table}.csv").as_str(),
         CsvReadOptions::new().schema(&schema),
     )
     .await?;
@@ -580,7 +910,9 @@ async fn register_tpch_csv_data(
                 DataType::Date32 => {
                     let sb = col.as_any_mut().downcast_mut::<Date32Builder>().unwrap();
                     let dt = NaiveDate::parse_from_str(val.trim(), "%Y-%m-%d").unwrap();
-                    let dt = dt.sub(NaiveDate::from_ymd(1970, 1, 1)).num_days() as i32;
+                    let dt = dt
+                        .sub(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+                        .num_days() as i32;
                     sb.append_value(dt);
                 }
                 DataType::Int32 => {
@@ -653,9 +985,8 @@ async fn register_aggregate_csv_by_sql(ctx: &SessionContext) {
     )
     STORED AS CSV
     WITH HEADER ROW
-    LOCATION '{}/csv/aggregate_test_100.csv'
-    ",
-            testdata
+    LOCATION '{testdata}/csv/aggregate_test_100.csv'
+    "
         ))
         .await
         .expect("Creating dataframe for CREATE EXTERNAL TABLE");
@@ -714,7 +1045,7 @@ async fn register_aggregate_simple_csv(ctx: &SessionContext) -> Result<()> {
 
     ctx.register_csv(
         "aggregate_simple",
-        "tests/aggregate_simple.csv",
+        "tests/data/aggregate_simple.csv",
         CsvReadOptions::new().schema(&schema),
     )
     .await?;
@@ -731,7 +1062,7 @@ async fn register_aggregate_null_cases_csv(ctx: &SessionContext) -> Result<()> {
 
     ctx.register_csv(
         "null_cases",
-        "tests/null_cases.csv",
+        "tests/data/null_cases.csv",
         CsvReadOptions::new().schema(&schema),
     )
     .await?;
@@ -743,7 +1074,7 @@ async fn register_aggregate_csv(ctx: &SessionContext) -> Result<()> {
     let schema = test_util::aggr_test_schema();
     ctx.register_csv(
         "aggregate_test_100",
-        &format!("{}/csv/aggregate_test_100.csv", testdata),
+        &format!("{testdata}/csv/aggregate_test_100.csv"),
         CsvReadOptions::new().schema(&schema),
     )
     .await?;
@@ -760,61 +1091,28 @@ async fn try_execute_to_batches(
     ctx: &SessionContext,
     sql: &str,
 ) -> Result<Vec<RecordBatch>> {
-    let plan = ctx.create_logical_plan(sql)?;
-    let logical_schema = plan.schema();
+    let dataframe = ctx.sql(sql).await?;
+    let logical_schema = dataframe.schema().clone();
+    let (state, plan) = dataframe.into_parts();
 
-    let plan = ctx.optimize(&plan)?;
-    let optimized_logical_schema = plan.schema();
-
-    let plan = ctx.create_physical_plan(&plan).await?;
-
-    let task_ctx = ctx.task_ctx();
-    let results = collect(plan, task_ctx).await?;
-
-    assert_eq!(logical_schema.as_ref(), optimized_logical_schema.as_ref());
-    Ok(results)
+    let optimized = state.optimize(&plan)?;
+    assert_eq!(&logical_schema, optimized.schema().as_ref());
+    DataFrame::new(state, optimized).collect().await
 }
 
 /// Execute query and return results as a Vec of RecordBatches
 async fn execute_to_batches(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
-    let msg = format!("Creating logical plan for '{}'", sql);
-    let plan = ctx
-        .create_logical_plan(sql)
-        .map_err(|e| format!("{:?} at {}", e, msg))
-        .unwrap();
-    let logical_schema = plan.schema();
+    let df = ctx.sql(sql).await.unwrap();
 
     // We are not really interested in the direct output of optimized_logical_plan
     // since the physical plan construction already optimizes the given logical plan
     // and we want to avoid double-optimization as a consequence. So we just construct
     // it here to make sure that it doesn't fail at this step and get the optimized
     // schema (to assert later that the logical and optimized schemas are the same).
-    let msg = format!("Optimizing logical plan for '{}': {:?}", sql, plan);
-    let optimized_logical_plan = ctx
-        .optimize(&plan)
-        .map_err(|e| format!("{:?} at {}", e, msg))
-        .unwrap();
-    let optimized_logical_schema = optimized_logical_plan.schema();
+    let optimized = df.clone().into_optimized_plan().unwrap();
+    assert_eq!(df.logical_plan().schema(), optimized.schema());
 
-    let msg = format!(
-        "Creating physical plan for '{}': {:?}",
-        sql, optimized_logical_plan
-    );
-    let plan = ctx
-        .create_physical_plan(&plan)
-        .await
-        .map_err(|e| format!("{:?} at {}", e, msg))
-        .unwrap();
-
-    let msg = format!("Executing physical plan for '{}': {:?}", sql, plan);
-    let task_ctx = ctx.task_ctx();
-    let results = collect(plan, task_ctx)
-        .await
-        .map_err(|e| format!("{:?} at {}", e, msg))
-        .unwrap();
-
-    assert_eq!(logical_schema.as_ref(), optimized_logical_schema.as_ref());
-    results
+    df.collect().await.unwrap()
 }
 
 /// Execute query and return result set as 2-d table of Vecs
@@ -868,8 +1166,8 @@ fn populate_csv_partitions(
 
     // generate a partitioned file
     for partition in 0..partition_count {
-        let filename = format!("partition-{}.{}", partition, file_extension);
-        let file_path = tmp_dir.path().join(&filename);
+        let filename = format!("partition-{partition}.{file_extension}");
+        let file_path = tmp_dir.path().join(filename);
         let mut file = File::create(file_path)?;
 
         // generate some data
@@ -946,35 +1244,11 @@ fn result_vec(results: &[RecordBatch]) -> Vec<Vec<String>> {
     result
 }
 
-async fn register_decimal_csv_table_by_sql(ctx: &SessionContext) {
-    let df = ctx
-        .sql(
-            "CREATE EXTERNAL TABLE decimal_simple (
-            c1  DECIMAL(10,6) NOT NULL,
-            c2  DOUBLE NOT NULL,
-            c3  BIGINT NOT NULL,
-            c4  BOOLEAN NOT NULL,
-            c5  DECIMAL(12,7) NOT NULL
-            )
-            STORED AS CSV
-            WITH HEADER ROW
-            LOCATION 'tests/decimal_data.csv'",
-        )
-        .await
-        .expect("Creating dataframe for CREATE EXTERNAL TABLE with decimal data type");
-
-    let results = df.collect().await.expect("Executing CREATE EXTERNAL TABLE");
-    assert!(
-        results.is_empty(),
-        "Expected no rows from executing CREATE EXTERNAL TABLE"
-    );
-}
-
 async fn register_alltypes_parquet(ctx: &SessionContext) {
     let testdata = datafusion::test_util::parquet_test_data();
     ctx.register_parquet(
         "alltypes_plain",
-        &format!("{}/alltypes_plain.parquet", testdata),
+        &format!("{testdata}/alltypes_plain.parquet"),
         ParquetReadOptions::default(),
     )
     .await
@@ -983,14 +1257,14 @@ async fn register_alltypes_parquet(ctx: &SessionContext) {
 
 fn make_timestamp_table<A>() -> Result<Arc<MemTable>>
 where
-    A: ArrowTimestampType,
+    A: ArrowTimestampType<Native = i64>,
 {
     make_timestamp_tz_table::<A>(None)
 }
 
 fn make_timestamp_tz_table<A>(tz: Option<String>) -> Result<Arc<MemTable>>
 where
-    A: ArrowTimestampType,
+    A: ArrowTimestampType<Native = i64>,
 {
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -1014,7 +1288,7 @@ where
         1599565349190855000 / divisor,    // 2020-09-08T11:42:29.190855+00:00
     ]; // 2020-09-08T11:42:29.190855+00:00
 
-    let array = PrimitiveArray::<A>::from_vec(timestamps, tz);
+    let array = PrimitiveArray::<A>::from_iter_values(timestamps).with_timezone_opt(tz);
 
     let data = RecordBatch::try_new(
         schema.clone(),
@@ -1149,13 +1423,106 @@ pub fn make_timestamps() -> RecordBatch {
     let names = ts_nanos
         .iter()
         .enumerate()
-        .map(|(i, _)| format!("Row {}", i))
+        .map(|(i, _)| format!("Row {i}"))
         .collect::<Vec<_>>();
 
-    let arr_nanos = TimestampNanosecondArray::from_opt_vec(ts_nanos, None);
-    let arr_micros = TimestampMicrosecondArray::from_opt_vec(ts_micros, None);
-    let arr_millis = TimestampMillisecondArray::from_opt_vec(ts_millis, None);
-    let arr_secs = TimestampSecondArray::from_opt_vec(ts_secs, None);
+    let arr_nanos = TimestampNanosecondArray::from(ts_nanos);
+    let arr_micros = TimestampMicrosecondArray::from(ts_micros);
+    let arr_millis = TimestampMillisecondArray::from(ts_millis);
+    let arr_secs = TimestampSecondArray::from(ts_secs);
+
+    let names = names.iter().map(|s| s.as_str()).collect::<Vec<_>>();
+    let arr_names = StringArray::from(names);
+
+    let schema = Schema::new(vec![
+        Field::new("nanos", arr_nanos.data_type().clone(), true),
+        Field::new("micros", arr_micros.data_type().clone(), true),
+        Field::new("millis", arr_millis.data_type().clone(), true),
+        Field::new("secs", arr_secs.data_type().clone(), true),
+        Field::new("name", arr_names.data_type().clone(), true),
+    ]);
+    let schema = Arc::new(schema);
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arr_nanos),
+            Arc::new(arr_micros),
+            Arc::new(arr_millis),
+            Arc::new(arr_secs),
+            Arc::new(arr_names),
+        ],
+    )
+    .unwrap()
+}
+
+/// Return a new table provider containing all of the supported timestamp types
+pub fn table_with_times() -> Arc<dyn TableProvider> {
+    let batch = make_times();
+    let schema = batch.schema();
+    let partitions = vec![vec![batch]];
+    Arc::new(MemTable::try_new(schema, partitions).unwrap())
+}
+
+/// Return  record batch with all of the supported time types
+/// values
+///
+/// Columns are named:
+/// "nanos" --> Time64NanosecondArray
+/// "micros" --> Time64MicrosecondArray
+/// "millis" --> Time32MillisecondArray
+/// "secs" --> Time32SecondArray
+/// "names" --> StringArray
+pub fn make_times() -> RecordBatch {
+    let ts_strings = vec![
+        Some("18:06:30.243620451"),
+        Some("20:08:28.161121654"),
+        Some("19:11:04.156423842"),
+        Some("21:06:28.247821084"),
+    ];
+
+    let ts_nanos = ts_strings
+        .into_iter()
+        .map(|t| {
+            t.map(|t| {
+                let integer_sec = t
+                    .parse::<chrono::NaiveTime>()
+                    .unwrap()
+                    .num_seconds_from_midnight() as i64;
+                let extra_nano =
+                    t.parse::<chrono::NaiveTime>().unwrap().nanosecond() as i64;
+                // Total time in nanoseconds given by integer number of seconds multiplied by 10^9
+                // plus number of nanoseconds corresponding to the extra fraction of second
+                integer_sec * 1_000_000_000 + extra_nano
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let ts_micros = ts_nanos
+        .iter()
+        .map(|t| t.as_ref().map(|ts_nanos| ts_nanos / 1000))
+        .collect::<Vec<_>>();
+
+    let ts_millis = ts_nanos
+        .iter()
+        .map(|t| t.as_ref().map(|ts_nanos| { ts_nanos / 1000000 } as i32))
+        .collect::<Vec<_>>();
+
+    let ts_secs = ts_nanos
+        .iter()
+        .map(|t| t.as_ref().map(|ts_nanos| { ts_nanos / 1000000000 } as i32))
+        .collect::<Vec<_>>();
+
+    let names = ts_nanos
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("Row {i}"))
+        .collect::<Vec<_>>();
+
+    let arr_nanos = Time64NanosecondArray::from(ts_nanos);
+    let arr_micros = Time64MicrosecondArray::from(ts_micros);
+    let arr_millis = Time32MillisecondArray::from(ts_millis);
+    let arr_secs = Time32SecondArray::from(ts_secs);
 
     let names = names.iter().map(|s| s.as_str()).collect::<Vec<_>>();
     let arr_names = StringArray::from(names);
@@ -1213,12 +1580,13 @@ async fn nyc() -> Result<()> {
     )
     .await?;
 
-    let logical_plan = ctx.create_logical_plan(
-        "SELECT passenger_count, MIN(fare_amount), MAX(fare_amount) \
+    let dataframe = ctx
+        .sql(
+            "SELECT passenger_count, MIN(fare_amount), MAX(fare_amount) \
          FROM tripdata GROUP BY passenger_count",
-    )?;
-
-    let optimized_plan = ctx.optimize(&logical_plan)?;
+        )
+        .await?;
+    let optimized_plan = dataframe.into_optimized_plan().unwrap();
 
     match &optimized_plan {
         LogicalPlan::Projection(Projection { input, .. }) => match input.as_ref() {

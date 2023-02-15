@@ -18,7 +18,6 @@
 //! Common unit test utility methods
 
 use crate::arrow::array::UInt32Array;
-use crate::config::ConfigOptions;
 use crate::datasource::file_format::file_type::{FileCompressionType, FileType};
 use crate::datasource::listing::PartitionedFile;
 use crate::datasource::object_store::ObjectStoreUrl;
@@ -33,9 +32,13 @@ use array::ArrayRef;
 use arrow::array::{self, Array, Decimal128Builder, Int32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+#[cfg(feature = "compression")]
 use bzip2::write::BzEncoder;
+#[cfg(feature = "compression")]
 use bzip2::Compression as BzCompression;
+#[cfg(feature = "compression")]
 use flate2::write::GzEncoder;
+#[cfg(feature = "compression")]
 use flate2::Compression as GzCompression;
 use futures::{Future, FutureExt};
 use std::fs::File;
@@ -44,6 +47,8 @@ use std::io::{BufReader, BufWriter};
 use std::pin::Pin;
 use std::sync::Arc;
 use tempfile::TempDir;
+#[cfg(feature = "compression")]
+use xz2::write::XzEncoder;
 
 pub fn create_table_dual() -> Arc<dyn TableProvider> {
     let dual_schema = Arc::new(Schema::new(vec![
@@ -53,8 +58,8 @@ pub fn create_table_dual() -> Arc<dyn TableProvider> {
     let batch = RecordBatch::try_new(
         dual_schema.clone(),
         vec![
-            Arc::new(array::Int32Array::from_slice(&[1])),
-            Arc::new(array::StringArray::from_slice(&["a"])),
+            Arc::new(array::Int32Array::from_slice([1])),
+            Arc::new(array::StringArray::from_slice(["a"])),
         ],
     )
     .unwrap();
@@ -91,7 +96,7 @@ pub fn partitioned_file_groups(
     file_type: FileType,
     file_compression_type: FileCompressionType,
 ) -> Result<Vec<Vec<PartitionedFile>>> {
-    let path = format!("{}/{}", path, filename);
+    let path = format!("{path}/{filename}");
 
     let tmp_dir = TempDir::new()?.into_path();
 
@@ -106,17 +111,27 @@ pub fn partitioned_file_groups(
                 .get_ext_with_compression(file_compression_type.to_owned())
                 .unwrap()
         );
-        let filename = tmp_dir.join(&filename);
+        let filename = tmp_dir.join(filename);
 
         let file = File::create(&filename).unwrap();
 
         let encoder: Box<dyn Write + Send> = match file_compression_type.to_owned() {
             FileCompressionType::UNCOMPRESSED => Box::new(file),
+            #[cfg(feature = "compression")]
             FileCompressionType::GZIP => {
                 Box::new(GzEncoder::new(file, GzCompression::default()))
             }
+            #[cfg(feature = "compression")]
+            FileCompressionType::XZ => Box::new(XzEncoder::new(file, 9)),
+            #[cfg(feature = "compression")]
             FileCompressionType::BZIP2 => {
                 Box::new(BzEncoder::new(file, BzCompression::default()))
+            }
+            #[cfg(not(feature = "compression"))]
+            FileCompressionType::GZIP
+            | FileCompressionType::BZIP2
+            | FileCompressionType::XZ => {
+                panic!("GZIP compression is not supported in this build")
             }
         };
 
@@ -125,7 +140,7 @@ pub fn partitioned_file_groups(
         files.push(filename);
     }
 
-    let f = File::open(&path)?;
+    let f = File::open(path)?;
     let f = BufReader::new(f);
     for (i, line) in f.lines().enumerate() {
         let line = line.unwrap();
@@ -166,7 +181,8 @@ pub fn partitioned_csv_config(
         projection: None,
         limit: None,
         table_partition_cols: vec![],
-        config_options: ConfigOptions::new().into_shareable(),
+        output_ordering: None,
+        infinite_source: false,
     })
 }
 
@@ -282,7 +298,7 @@ pub fn create_vec_batches(schema: &Schema, n: usize) -> Vec<RecordBatch> {
 fn create_batch(schema: &Schema) -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(schema.clone()),
-        vec![Arc::new(UInt32Array::from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]))],
+        vec![Arc::new(UInt32Array::from_slice([1, 2, 3, 4, 5, 6, 7, 8]))],
     )
     .unwrap()
 }

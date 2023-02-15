@@ -29,7 +29,6 @@ use super::{
 };
 use crate::error::Result;
 use arrow::datatypes::SchemaRef;
-use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
 
 use crate::execution::context::TaskContext;
@@ -81,17 +80,12 @@ impl ExecutionPlan for MemoryExec {
         None
     }
 
-    fn relies_on_input_order(&self) -> bool {
-        false
-    }
-
     fn with_new_children(
         self: Arc<Self>,
         _: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Err(DataFusionError::Internal(format!(
-            "Children cannot be replaced in {:?}",
-            self
+            "Children cannot be replaced in {self:?}"
         )))
     }
 
@@ -183,7 +177,7 @@ impl MemoryStream {
 }
 
 impl Stream for MemoryStream {
-    type Item = ArrowResult<RecordBatch>;
+    type Item = Result<RecordBatch>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -238,10 +232,10 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int32Array::from_slice(&[1, 2, 3])),
-                Arc::new(Int32Array::from_slice(&[4, 5, 6])),
+                Arc::new(Int32Array::from_slice([1, 2, 3])),
+                Arc::new(Int32Array::from_slice([4, 5, 6])),
                 Arc::new(Int32Array::from(vec![None, None, Some(9)])),
-                Arc::new(Int32Array::from_slice(&[7, 8, 9])),
+                Arc::new(Int32Array::from_slice([7, 8, 9])),
             ],
         )?;
 

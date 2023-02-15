@@ -156,12 +156,18 @@ pub enum BuiltinScalarFunction {
     FromUnixtime,
     ///now
     Now,
+    ///current_date
+    CurrentDate,
+    /// current_time
+    CurrentTime,
     /// translate
     Translate,
     /// trim
     Trim,
     /// upper
     Upper,
+    /// uuid
+    Uuid,
     /// regexp_match
     RegexpMatch,
     /// struct
@@ -176,7 +182,11 @@ impl BuiltinScalarFunction {
     pub fn supports_zero_argument(&self) -> bool {
         matches!(
             self,
-            BuiltinScalarFunction::Random | BuiltinScalarFunction::Now
+            BuiltinScalarFunction::Random
+                | BuiltinScalarFunction::Now
+                | BuiltinScalarFunction::CurrentDate
+                | BuiltinScalarFunction::CurrentTime
+                | BuiltinScalarFunction::Uuid
         )
     }
     /// Returns the [Volatility] of the builtin function.
@@ -254,9 +264,12 @@ impl BuiltinScalarFunction {
 
             // Stable builtin functions
             BuiltinScalarFunction::Now => Volatility::Stable,
+            BuiltinScalarFunction::CurrentDate => Volatility::Stable,
+            BuiltinScalarFunction::CurrentTime => Volatility::Stable,
 
             // Volatile builtin functions
             BuiltinScalarFunction::Random => Volatility::Volatile,
+            BuiltinScalarFunction::Uuid => Volatility::Volatile,
         }
     }
 }
@@ -264,7 +277,7 @@ impl BuiltinScalarFunction {
 impl fmt::Display for BuiltinScalarFunction {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // lowercase of the debug.
-        write!(f, "{}", format!("{:?}", self).to_lowercase())
+        write!(f, "{}", format!("{self:?}").to_lowercase())
     }
 }
 
@@ -309,6 +322,8 @@ impl FromStr for BuiltinScalarFunction {
             "concat" => BuiltinScalarFunction::Concat,
             "concat_ws" => BuiltinScalarFunction::ConcatWithSeparator,
             "chr" => BuiltinScalarFunction::Chr,
+            "current_date" => BuiltinScalarFunction::CurrentDate,
+            "current_time" => BuiltinScalarFunction::CurrentTime,
             "date_part" | "datepart" => BuiltinScalarFunction::DatePart,
             "date_trunc" | "datetrunc" => BuiltinScalarFunction::DateTrunc,
             "date_bin" => BuiltinScalarFunction::DateBin,
@@ -347,14 +362,14 @@ impl FromStr for BuiltinScalarFunction {
             "translate" => BuiltinScalarFunction::Translate,
             "trim" => BuiltinScalarFunction::Trim,
             "upper" => BuiltinScalarFunction::Upper,
+            "uuid" => BuiltinScalarFunction::Uuid,
             "regexp_match" => BuiltinScalarFunction::RegexpMatch,
             "struct" => BuiltinScalarFunction::Struct,
             "from_unixtime" => BuiltinScalarFunction::FromUnixtime,
             "arrow_typeof" => BuiltinScalarFunction::ArrowTypeof,
             _ => {
                 return Err(DataFusionError::Plan(format!(
-                    "There is no built-in function named {}",
-                    name
+                    "There is no built-in function named {name}"
                 )))
             }
         })

@@ -23,7 +23,6 @@ use crate::scheduler::{
     Spawner,
 };
 use arrow::datatypes::SchemaRef;
-use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use futures::channel::mpsc;
 use futures::task::ArcWake;
@@ -108,17 +107,24 @@ impl Task {
         routable: &RoutablePipeline,
         error: DataFusionError,
     ) {
-        self.context.send_query_output(partition, Err(error));
-        if let Some(link) = routable.output {
-            trace!(
-                "Closing pipeline: {:?}, partition: {}, due to error",
-                link,
-                self.waker.partition,
-            );
+        match routable.output {
+            Some(link) => {
+                // The query output partitioning may not match the current pipeline's
+                // but the query output has at least one partition
+                // so send error to the first partition of the query output.
+                self.context.send_query_output(0, Err(error));
 
-            self.context.pipelines[link.pipeline]
-                .pipeline
-                .close(link.child, self.waker.partition);
+                trace!(
+                    "Closing pipeline: {:?}, partition: {}, due to error",
+                    link,
+                    self.waker.partition,
+                );
+
+                self.context.pipelines[link.pipeline]
+                    .pipeline
+                    .close(link.child, self.waker.partition);
+            }
+            None => self.context.send_query_output(partition, Err(error)),
         }
     }
 
@@ -254,14 +260,14 @@ struct ExecutionResultStream {
 }
 
 impl Stream for ExecutionResultStream {
-    type Item = arrow::error::Result<RecordBatch>;
+    type Item = Result<RecordBatch>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let opt = ready!(self.receiver.poll_next_unpin(cx)).flatten();
-        Poll::Ready(opt.map(|r| r.map_err(|e| ArrowError::ExternalError(Box::new(e)))))
+        Poll::Ready(opt)
     }
 }
 
@@ -303,6 +309,10 @@ impl ExecutionContext {
 
     /// Sends `output` to this query's output stream
     fn send_query_output(&self, partition: usize, output: Result<RecordBatch>) {
+        debug_assert!(
+            self.output.len() > partition,
+            "the specified partition exceeds the total number of output partitions"
+        );
         let _ = self.output[partition].unbounded_send(Some(output));
     }
 

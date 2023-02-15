@@ -25,9 +25,9 @@ use crate::physical_plan::{displayable, ColumnStatistics, ExecutionPlan, Statist
 use arrow::compute::concat;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
-use arrow::error::Result as ArrowResult;
-use arrow::ipc::writer::FileWriter;
+use arrow::ipc::writer::{FileWriter, IpcWriteOptions};
 use arrow::record_batch::RecordBatch;
+use datafusion_physical_expr::PhysicalSortExpr;
 use futures::{Future, Stream, StreamExt, TryStreamExt};
 use log::debug;
 use pin_project_lite::pin_project;
@@ -52,7 +52,7 @@ impl SizedRecordBatchStream {
     pub fn new(
         schema: SchemaRef,
         batches: Vec<Arc<RecordBatch>>,
-        metrics: MemTrackingMetrics,
+        mut metrics: MemTrackingMetrics,
     ) -> Self {
         let size = batches.iter().map(|b| batch_byte_size(b)).sum::<usize>();
         metrics.init_mem_used(size);
@@ -66,7 +66,7 @@ impl SizedRecordBatchStream {
 }
 
 impl Stream for SizedRecordBatchStream {
-    type Item = ArrowResult<RecordBatch>;
+    type Item = Result<RecordBatch>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -90,36 +90,50 @@ impl RecordBatchStream for SizedRecordBatchStream {
 
 /// Create a vector of record batches from a stream
 pub async fn collect(stream: SendableRecordBatchStream) -> Result<Vec<RecordBatch>> {
-    stream
-        .try_collect::<Vec<_>>()
-        .await
-        .map_err(DataFusionError::from)
+    stream.try_collect::<Vec<_>>().await
 }
 
-/// Combine a slice of record batches into one, or returns None if the slice itself
-/// is empty; all the record batches inside the slice must be of the same schema.
-pub(crate) fn combine_batches(
-    batches: &[RecordBatch],
+/// Merge two record batch references into a single record batch.
+/// All the record batches inside the slice must have the same schema.
+pub fn merge_batches(
+    first: &RecordBatch,
+    second: &RecordBatch,
     schema: SchemaRef,
-) -> ArrowResult<Option<RecordBatch>> {
-    if batches.is_empty() {
-        Ok(None)
+) -> Result<RecordBatch> {
+    let columns = (0..schema.fields.len())
+        .map(|index| {
+            let first_column = first.column(index).as_ref();
+            let second_column = second.column(index).as_ref();
+            concat(&[first_column, second_column])
+        })
+        .collect::<Result<Vec<_>, ArrowError>>()
+        .map_err(Into::<DataFusionError>::into)?;
+    RecordBatch::try_new(schema, columns).map_err(Into::into)
+}
+
+/// Merge a slice of record batch references into a single record batch, or
+/// return `None` if the slice itself is empty. All the record batches inside the
+/// slice must have the same schema.
+pub fn merge_multiple_batches(
+    batches: &[&RecordBatch],
+    schema: SchemaRef,
+) -> Result<Option<RecordBatch>> {
+    Ok(if batches.is_empty() {
+        None
     } else {
-        let columns = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
+        let columns = (0..schema.fields.len())
+            .map(|index| {
                 concat(
                     &batches
                         .iter()
-                        .map(|batch| batch.column(i).as_ref())
+                        .map(|batch| batch.column(index).as_ref())
                         .collect::<Vec<_>>(),
                 )
             })
-            .collect::<ArrowResult<Vec<_>>>()?;
-        Ok(Some(RecordBatch::try_new(schema.clone(), columns)?))
-    }
+            .collect::<Result<Vec<_>, ArrowError>>()
+            .map_err(Into::<DataFusionError>::into)?;
+        Some(RecordBatch::try_new(schema, columns)?)
+    })
 }
 
 /// Recursively builds a list of files in a directory with a given extension
@@ -128,9 +142,7 @@ pub fn build_checked_file_list(dir: &str, ext: &str) -> Result<Vec<String>> {
     build_file_list_recurse(dir, &mut filenames, ext)?;
     if filenames.is_empty() {
         return Err(DataFusionError::Plan(format!(
-            "No files found at {path} with file extension {file_extension}",
-            path = dir,
-            file_extension = ext
+            "No files found at {dir} with file extension {ext}"
         )));
     }
     Ok(filenames)
@@ -175,7 +187,7 @@ fn build_file_list_recurse(
 /// Spawns a task to the tokio threadpool and writes its outputs to the provided mpsc sender
 pub(crate) fn spawn_execution(
     input: Arc<dyn ExecutionPlan>,
-    output: mpsc::Sender<ArrowResult<RecordBatch>>,
+    output: mpsc::Sender<Result<RecordBatch>>,
     partition: usize,
     context: Arc<TaskContext>,
 ) -> JoinHandle<()> {
@@ -184,8 +196,7 @@ pub(crate) fn spawn_execution(
             Err(e) => {
                 // If send fails, plan being torn down,
                 // there is no place to send the error.
-                let arrow_error = ArrowError::ExternalError(Box::new(e));
-                output.send(Err(arrow_error)).await.ok();
+                output.send(Err(e)).await.ok();
                 debug!(
                     "Stopping execution: error executing input: {}",
                     displayable(input.as_ref()).one_line()
@@ -271,7 +282,7 @@ impl<T> AbortOnDropSingle<T> {
 }
 
 impl<T> Future for AbortOnDropSingle<T> {
-    type Output = std::result::Result<T, tokio::task::JoinError>;
+    type Output = Result<T, tokio::task::JoinError>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
@@ -293,53 +304,238 @@ impl<T> Drop for AbortOnDropMany<T> {
     }
 }
 
+/// Transposes the given vector of vectors.
+pub fn transpose<T>(original: Vec<Vec<T>>) -> Vec<Vec<T>> {
+    match original.as_slice() {
+        [] => vec![],
+        [first, ..] => {
+            let mut result = (0..first.len()).map(|_| vec![]).collect::<Vec<_>>();
+            for row in original {
+                for (item, transposed_row) in row.into_iter().zip(&mut result) {
+                    transposed_row.push(item);
+                }
+            }
+            result
+        }
+    }
+}
+
+/// Calculates the "meet" of given orderings.
+/// The meet is the finest ordering that satisfied by all the given
+/// orderings, see <https://en.wikipedia.org/wiki/Join_and_meet>.
+pub fn get_meet_of_orderings(
+    given: &[Arc<dyn ExecutionPlan>],
+) -> Option<&[PhysicalSortExpr]> {
+    given
+        .iter()
+        .map(|item| item.output_ordering())
+        .collect::<Option<Vec<_>>>()
+        .and_then(get_meet_of_orderings_helper)
+}
+
+fn get_meet_of_orderings_helper(
+    orderings: Vec<&[PhysicalSortExpr]>,
+) -> Option<&[PhysicalSortExpr]> {
+    let mut idx = 0;
+    let first = orderings[0];
+    loop {
+        for ordering in orderings.iter() {
+            if idx >= ordering.len() {
+                return Some(ordering);
+            } else if ordering[idx] != first[idx] {
+                return if idx > 0 {
+                    Some(&ordering[..idx])
+                } else {
+                    None
+                };
+            }
+        }
+        idx += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::from_slice::FromSlice;
+    use crate::physical_plan::memory::MemoryExec;
+    use crate::physical_plan::sorts::sort::SortExec;
+    use crate::physical_plan::union::UnionExec;
+    use arrow::compute::SortOptions;
     use arrow::{
         array::{Float32Array, Float64Array},
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     };
+    use datafusion_physical_expr::expressions::{col, Column};
 
     #[test]
-    fn test_combine_batches_empty() -> Result<()> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("f32", DataType::Float32, false),
-            Field::new("f64", DataType::Float64, false),
-        ]));
-        let result = combine_batches(&[], schema)?;
+    fn get_meet_of_orderings_helper_common_prefix_test() -> Result<()> {
+        let input1: Vec<PhysicalSortExpr> = vec![
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("a", 0)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("b", 1)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("c", 2)),
+                options: SortOptions::default(),
+            },
+        ];
+
+        let input2: Vec<PhysicalSortExpr> = vec![
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("a", 0)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("b", 1)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("y", 2)),
+                options: SortOptions::default(),
+            },
+        ];
+
+        let input3: Vec<PhysicalSortExpr> = vec![
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("a", 0)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("x", 1)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("y", 2)),
+                options: SortOptions::default(),
+            },
+        ];
+
+        let expected = vec![PhysicalSortExpr {
+            expr: Arc::new(Column::new("a", 0)),
+            options: SortOptions::default(),
+        }];
+
+        let result = get_meet_of_orderings_helper(vec![&input1, &input2, &input3]);
+        assert_eq!(result.unwrap(), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn get_meet_of_orderings_helper_subset_test() -> Result<()> {
+        let input1: Vec<PhysicalSortExpr> = vec![
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("a", 0)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("b", 1)),
+                options: SortOptions::default(),
+            },
+        ];
+
+        let input2: Vec<PhysicalSortExpr> = vec![
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("a", 0)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("b", 1)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("c", 2)),
+                options: SortOptions::default(),
+            },
+        ];
+
+        let input3: Vec<PhysicalSortExpr> = vec![
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("a", 0)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("b", 1)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("d", 2)),
+                options: SortOptions::default(),
+            },
+        ];
+
+        let result = get_meet_of_orderings_helper(vec![&input1, &input2, &input3]);
+        assert_eq!(result.unwrap(), input1);
+        Ok(())
+    }
+
+    #[test]
+    fn get_meet_of_orderings_helper_no_overlap_test() -> Result<()> {
+        let input1: Vec<PhysicalSortExpr> = vec![
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("a", 0)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("b", 1)),
+                options: SortOptions::default(),
+            },
+        ];
+
+        let input2: Vec<PhysicalSortExpr> = vec![
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("x", 0)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("a", 1)),
+                options: SortOptions::default(),
+            },
+        ];
+
+        let input3: Vec<PhysicalSortExpr> = vec![
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("a", 0)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("y", 1)),
+                options: SortOptions::default(),
+            },
+        ];
+
+        let result = get_meet_of_orderings_helper(vec![&input1, &input2, &input3]);
         assert!(result.is_none());
         Ok(())
     }
 
     #[test]
-    fn test_combine_batches() -> Result<()> {
+    fn test_meet_of_orderings() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("f32", DataType::Float32, false),
             Field::new("f64", DataType::Float64, false),
         ]));
+        let sort_expr = vec![PhysicalSortExpr {
+            expr: col("f32", &schema).unwrap(),
+            options: SortOptions::default(),
+        }];
+        let memory_exec = Arc::new(MemoryExec::try_new(&[], schema.clone(), None)?) as _;
+        let sort_exec = Arc::new(SortExec::try_new(sort_expr.clone(), memory_exec, None)?)
+            as Arc<dyn ExecutionPlan>;
+        let memory_exec2 = Arc::new(MemoryExec::try_new(&[], schema, None)?) as _;
+        // memory_exec2 doesn't have output ordering
+        let union_exec = UnionExec::new(vec![sort_exec.clone(), memory_exec2]);
+        let res = get_meet_of_orderings(union_exec.inputs());
+        assert!(res.is_none());
 
-        let batch_count = 1000;
-        let batch_size = 10;
-        let batches = (0..batch_count)
-            .map(|i| {
-                RecordBatch::try_new(
-                    Arc::clone(&schema),
-                    vec![
-                        Arc::new(Float32Array::from_slice(&vec![i as f32; batch_size])),
-                        Arc::new(Float64Array::from_slice(&vec![i as f64; batch_size])),
-                    ],
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-
-        let result = combine_batches(&batches, schema)?;
-        assert!(result.is_some());
-        let result = result.unwrap();
-        assert_eq!(batch_count * batch_size, result.num_rows());
+        let union_exec = UnionExec::new(vec![sort_exec.clone(), sort_exec]);
+        let res = get_meet_of_orderings(union_exec.inputs());
+        assert_eq!(res, Some(&sort_expr[..]));
         Ok(())
     }
 
@@ -366,8 +562,8 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(Float32Array::from_slice(&[1., 2., 3.])),
-                Arc::new(Float64Array::from_slice(&[9., 8., 7.])),
+                Arc::new(Float32Array::from_slice([1., 2., 3.])),
+                Arc::new(Float64Array::from_slice([9., 8., 7.])),
             ],
         )?;
         let actual =
@@ -399,15 +595,24 @@ mod tests {
         assert_eq!(actual, expected);
         Ok(())
     }
+
+    #[test]
+    fn test_transpose() -> Result<()> {
+        let in_data = vec![vec![1, 2, 3], vec![4, 5, 6]];
+        let transposed = transpose(in_data);
+        let expected = vec![vec![1, 4], vec![2, 5], vec![3, 6]];
+        assert_eq!(expected, transposed);
+        Ok(())
+    }
 }
 
 /// Write in Arrow IPC format.
 pub struct IPCWriter {
     /// path
     pub path: PathBuf,
-    /// Inner writer
+    /// inner writer
     pub writer: FileWriter<File>,
-    /// bathes written
+    /// batches written
     pub num_batches: u64,
     /// rows written
     pub num_rows: u64,
@@ -420,8 +625,7 @@ impl IPCWriter {
     pub fn new(path: &Path, schema: &Schema) -> Result<Self> {
         let file = File::create(path).map_err(|e| {
             DataFusionError::Execution(format!(
-                "Failed to create partition file at {:?}: {:?}",
-                path, e
+                "Failed to create partition file at {path:?}: {e:?}"
             ))
         })?;
         Ok(Self {
@@ -433,6 +637,25 @@ impl IPCWriter {
         })
     }
 
+    /// Create new writer with IPC write options
+    pub fn new_with_options(
+        path: &Path,
+        schema: &Schema,
+        write_options: IpcWriteOptions,
+    ) -> Result<Self> {
+        let file = File::create(path).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "Failed to create partition file at {path:?}: {e:?}"
+            ))
+        })?;
+        Ok(Self {
+            num_batches: 0,
+            num_rows: 0,
+            num_bytes: 0,
+            path: path.into(),
+            writer: FileWriter::try_new_with_options(file, schema, write_options)?,
+        })
+    }
     /// Write one single batch
     pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         self.writer.write(batch)?;
@@ -445,7 +668,7 @@ impl IPCWriter {
 
     /// Finish the writer
     pub fn finish(&mut self) -> Result<()> {
-        self.writer.finish().map_err(DataFusionError::ArrowError)
+        self.writer.finish().map_err(Into::into)
     }
 
     /// Path write to

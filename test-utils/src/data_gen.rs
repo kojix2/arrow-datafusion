@@ -19,13 +19,32 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::{
-    Int32Builder, StringBuilder, StringDictionaryBuilder, TimestampNanosecondBuilder,
-    UInt16Builder,
+    Decimal128Builder, Int32Builder, StringBuilder, StringDictionaryBuilder,
+    TimestampNanosecondBuilder, UInt16Builder,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
+
+#[derive(Debug, Clone)]
+struct GeneratorOptions {
+    row_limit: usize,
+    pods_per_host: Range<usize>,
+    containers_per_pod: Range<usize>,
+    entries_per_container: Range<usize>,
+}
+
+impl Default for GeneratorOptions {
+    fn default() -> Self {
+        Self {
+            row_limit: usize::MAX,
+            pods_per_host: 1..15,
+            containers_per_pod: 1..3,
+            entries_per_container: 1024..8192,
+        }
+    }
+}
 
 #[derive(Default)]
 struct BatchBuilder {
@@ -43,6 +62,10 @@ struct BatchBuilder {
     request_bytes: Int32Builder,
     response_bytes: Int32Builder,
     response_status: UInt16Builder,
+    prices_status: Decimal128Builder,
+
+    options: GeneratorOptions,
+    row_count: usize,
 }
 
 impl BatchBuilder {
@@ -69,22 +92,32 @@ impl BatchBuilder {
             Field::new("request_bytes", DataType::Int32, true),
             Field::new("response_bytes", DataType::Int32, true),
             Field::new("response_status", DataType::UInt16, false),
+            Field::new("decimal_price", DataType::Decimal128(38, 0), false),
         ]))
     }
 
+    fn is_finished(&self) -> bool {
+        self.options.row_limit <= self.row_count
+    }
+
     fn append(&mut self, rng: &mut StdRng, host: &str, service: &str) {
-        let num_pods = rng.gen_range(1..15);
+        let num_pods = rng.gen_range(self.options.pods_per_host.clone());
         let pods = generate_sorted_strings(rng, num_pods, 30..40);
         for pod in pods {
-            for container_idx in 0..rng.gen_range(1..3) {
-                let container = format!("{}_container_{}", service, container_idx);
+            let num_containers = rng.gen_range(self.options.containers_per_pod.clone());
+            for container_idx in 0..num_containers {
+                let container = format!("{service}_container_{container_idx}");
                 let image = format!(
-                    "{}@sha256:30375999bf03beec2187843017b10c9e88d8b1a91615df4eb6350fb39472edd9",
-                    container
+                    "{container}@sha256:30375999bf03beec2187843017b10c9e88d8b1a91615df4eb6350fb39472edd9"
                 );
 
-                let num_entries = rng.gen_range(1024..8192);
+                let num_entries =
+                    rng.gen_range(self.options.entries_per_container.clone());
                 for i in 0..num_entries {
+                    if self.is_finished() {
+                        return;
+                    }
+
                     let time = i as i64 * 1024;
                     self.append_row(rng, host, &pod, service, &container, &image, time);
                 }
@@ -103,6 +136,8 @@ impl BatchBuilder {
         image: &str,
         time: i64,
     ) {
+        self.row_count += 1;
+
         let methods = &["GET", "PUT", "POST", "HEAD", "PATCH", "DELETE"];
         let status = &[200, 204, 400, 503, 403];
 
@@ -126,7 +161,7 @@ impl BatchBuilder {
         self.request_method
             .append_value(methods[rng.gen_range(0..methods.len())]);
         self.request_host
-            .append_value(format!("https://{}.mydomain.com", service));
+            .append_value(format!("https://{service}.mydomain.com"));
 
         self.request_bytes
             .append_option(rng.gen_bool(0.9).then(|| rng.gen()));
@@ -134,6 +169,7 @@ impl BatchBuilder {
             .append_option(rng.gen_bool(0.9).then(|| rng.gen()));
         self.response_status
             .append_value(status[rng.gen_range(0..status.len())]);
+        self.prices_status.append_value(self.row_count as i128);
     }
 
     fn finish(mut self, schema: SchemaRef) -> RecordBatch {
@@ -154,6 +190,12 @@ impl BatchBuilder {
                 Arc::new(self.request_bytes.finish()),
                 Arc::new(self.response_bytes.finish()),
                 Arc::new(self.response_status.finish()),
+                Arc::new(
+                    self.prices_status
+                        .finish()
+                        .with_precision_and_scale(38, 0)
+                        .unwrap(),
+                ),
             ],
         )
         .unwrap()
@@ -185,11 +227,36 @@ fn generate_sorted_strings(
 /// usecases.
 ///
 /// This is useful for writing tests queries on such data
+///
+/// Here are the columns with example data:
+///
+/// ```text
+/// service:             'backend'
+/// host:                'i-1ec3ca3151468928.ec2.internal'
+/// pod:                 'aqcathnxqsphdhgjtgvxsfyiwbmhlmg'
+/// container:           'backend_container_0'
+/// image:               'backend_container_0@sha256:30375999bf03beec2187843017b10c9e88d8b1a91615df4eb6350fb39472edd9'
+/// time:                '1970-01-01 00:00:00'
+/// client_addr:         '127.216.178.64'
+/// request_duration_ns: -1261239112
+/// request_user_agent:  'kxttrfiiietlsaygzphhwlqcgngnumuphliejmxfdznuurswhdcicrlprbnocibvsbukiohjjbjdygwbfhxqvurm'
+/// request_method:      'PUT'
+/// request_host:        'https://backend.mydomain.com'
+/// request_bytes:       -312099516
+/// response_bytes:      1448834362
+/// response_status:     200
+/// ```
 #[derive(Debug)]
 pub struct AccessLogGenerator {
     schema: SchemaRef,
     rng: StdRng,
     host_idx: usize,
+    /// maximum rows per batch
+    max_batch_size: usize,
+    /// How many rows have been returned so far
+    row_count: usize,
+    /// Options
+    options: GeneratorOptions,
 }
 
 impl Default for AccessLogGenerator {
@@ -209,6 +276,9 @@ impl AccessLogGenerator {
             schema: BatchBuilder::schema(),
             host_idx: 0,
             rng: StdRng::from_seed(seed),
+            max_batch_size: usize::MAX,
+            row_count: 0,
+            options: Default::default(),
         }
     }
 
@@ -216,13 +286,57 @@ impl AccessLogGenerator {
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
+
+    /// Limit the maximum batch size
+    pub fn with_max_batch_size(mut self, batch_size: usize) -> Self {
+        self.max_batch_size = batch_size;
+        self
+    }
+
+    /// Return up to row_limit rows;
+    pub fn with_row_limit(mut self, row_limit: usize) -> Self {
+        self.options.row_limit = row_limit;
+        self
+    }
+
+    /// Set the number of pods per host
+    pub fn with_pods_per_host(mut self, range: Range<usize>) -> Self {
+        self.options.pods_per_host = range;
+        self
+    }
+
+    /// Set the number of containers per pod
+    pub fn with_containers_per_pod(mut self, range: Range<usize>) -> Self {
+        self.options.containers_per_pod = range;
+        self
+    }
+
+    /// Set the number of log entries per container
+    pub fn with_entries_per_container(mut self, range: Range<usize>) -> Self {
+        self.options.entries_per_container = range;
+        self
+    }
 }
 
 impl Iterator for AccessLogGenerator {
     type Item = RecordBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut builder = BatchBuilder::default();
+        if self.row_count == self.options.row_limit {
+            return None;
+        }
+
+        let row_limit = self
+            .max_batch_size
+            .min(self.options.row_limit - self.row_count);
+
+        let mut builder = BatchBuilder {
+            options: GeneratorOptions {
+                row_limit,
+                ..self.options.clone()
+            },
+            ..Default::default()
+        };
 
         let host = format!(
             "i-{:016x}.ec2.internal",
@@ -234,8 +348,15 @@ impl Iterator for AccessLogGenerator {
             if self.rng.gen_bool(0.5) {
                 continue;
             }
+            if builder.is_finished() {
+                break;
+            }
             builder.append(&mut self.rng, &host, service);
         }
-        Some(builder.finish(Arc::clone(&self.schema)))
+
+        let batch = builder.finish(Arc::clone(&self.schema));
+
+        self.row_count += batch.num_rows();
+        Some(batch)
     }
 }

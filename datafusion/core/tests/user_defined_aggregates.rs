@@ -22,13 +22,12 @@ use std::sync::Arc;
 
 use datafusion::{
     arrow::{
-        array::{as_primitive_array, ArrayRef, Float64Array, TimestampNanosecondArray},
+        array::{ArrayRef, Float64Array, TimestampNanosecondArray},
         datatypes::{DataType, Field, Float64Type, TimeUnit, TimestampNanosecondType},
         record_batch::RecordBatch,
     },
     assert_batches_eq,
     error::Result,
-    logical_expr::AggregateState,
     logical_expr::{
         AccumulatorFunctionImplementation, AggregateUDF, ReturnTypeFunction, Signature,
         StateTypeFunction, TypeSignature, Volatility,
@@ -37,6 +36,7 @@ use datafusion::{
     prelude::SessionContext,
     scalar::ScalarValue,
 };
+use datafusion_common::cast::as_primitive_array;
 
 #[tokio::test]
 /// Basic query for with a udaf returning a structure
@@ -47,7 +47,7 @@ async fn test_udf_returning_struct() {
         "+--------------------------------------------------+",
         "| first(t.value,t.time)                            |",
         "+--------------------------------------------------+",
-        "| {\"value\": 2, \"time\": 1970-01-01 00:00:00.000002} |",
+        "| {\"value\": 2, \"time\": 1970-01-01T00:00:00.000002} |",
         "+--------------------------------------------------+",
     ];
     assert_batches_eq!(expected, &execute(&ctx, sql).await);
@@ -62,7 +62,7 @@ async fn test_udf_returning_struct_sq() {
         "+-----------------+----------------------------+",
         "| sq.first[value] | sq.first[time]             |",
         "+-----------------+----------------------------+",
-        "| 2               | 1970-01-01 00:00:00.000002 |",
+        "| 2               | 1970-01-01T00:00:00.000002 |",
         "+-----------------+----------------------------+",
     ];
     assert_batches_eq!(expected, &execute(&ctx, sql).await);
@@ -78,13 +78,13 @@ async fn execute(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
 ///
 /// ```text
 /// value | time
-///  3.0  | 1970-01-01 00:00:00.000003
-///  2.0  | 1970-01-01 00:00:00.000002
-///  1.0  | 1970-01-01 00:00:00.000004
+///  3.0  | 1970-01-01T00:00:00.000003
+///  2.0  | 1970-01-01T00:00:00.000002
+///  1.0  | 1970-01-01T00:00:00.000004
 /// ```
 fn udaf_struct_context() -> SessionContext {
     let value: Float64Array = vec![3.0, 2.0, 1.0].into_iter().map(Some).collect();
-    let time = TimestampNanosecondArray::from_vec(vec![3000, 2000, 4000], None);
+    let time = TimestampNanosecondArray::from(vec![3000, 2000, 4000]);
 
     let batch = RecordBatch::try_from_iter(vec![
         ("value", Arc::new(value) as _),
@@ -127,10 +127,7 @@ fn register_aggregate(ctx: &mut SessionContext) {
     );
 
     // register the selector as "first"
-    ctx.state
-        .write()
-        .aggregate_functions
-        .insert(name.to_string(), Arc::new(first));
+    ctx.register_udaf(first)
 }
 
 /// This structureg models a specialized timeseries aggregate function
@@ -209,12 +206,8 @@ impl FirstSelector {
 }
 
 impl Accumulator for FirstSelector {
-    fn state(&self) -> Result<Vec<AggregateState>> {
-        let state = self
-            .to_state()
-            .into_iter()
-            .map(AggregateState::Scalar)
-            .collect::<Vec<_>>();
+    fn state(&self) -> Result<Vec<ScalarValue>> {
+        let state = self.to_state().into_iter().collect::<Vec<_>>();
 
         Ok(state)
     }
@@ -227,8 +220,8 @@ impl Accumulator for FirstSelector {
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
         // cast argumets to the appropriate type (DataFusion will type
         // check these based on the declared allowed input types)
-        let v = as_primitive_array::<Float64Type>(&values[0]);
-        let t = as_primitive_array::<TimestampNanosecondType>(&values[1]);
+        let v = as_primitive_array::<Float64Type>(&values[0])?;
+        let t = as_primitive_array::<TimestampNanosecondType>(&values[1])?;
 
         // Update the actual values
         for (value, time) in v.iter().zip(t.iter()) {
@@ -243,5 +236,9 @@ impl Accumulator for FirstSelector {
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
         // same logic is needed as in update_batch
         self.update_batch(states)
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self)
     }
 }

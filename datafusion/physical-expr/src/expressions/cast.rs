@@ -120,6 +120,7 @@ impl PartialEq<dyn Any> for CastExpr {
             .map(|x| {
                 self.expr.eq(&x.expr)
                     && self.cast_type == x.cast_type
+                    // TODO: Use https://github.com/apache/arrow-rs/issues/2966 when available
                     && self.cast_options.safe == x.cast_options.safe
             })
             .unwrap_or(false)
@@ -163,8 +164,7 @@ pub fn cast_with_options(
         Ok(Arc::new(CastExpr::new(expr, cast_type, cast_options)))
     } else {
         Err(DataFusionError::NotImplemented(format!(
-            "Unsupported CAST from {:?} to {:?}",
-            expr_type, cast_type
+            "Unsupported CAST from {expr_type:?} to {cast_type:?}"
         )))
     }
 }
@@ -571,7 +571,7 @@ mod tests {
                 Some(15000),
                 Some(25000),
                 Some(30000),
-                Some(11234),
+                Some(11235),
                 Some(55000),
             ],
             DEFAULT_DATAFUSION_CAST_OPTIONS

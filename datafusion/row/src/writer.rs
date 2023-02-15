@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! [`RowWriter`]  writes [`RecordBatch`]es to Vec<u8> to stitch attributes together
+//! [`RowWriter`] writes [`RecordBatch`]es to `Vec<u8>` to stitch attributes together
 
 use crate::layout::{estimate_row_width, RowLayout, RowType};
 use arrow::array::*;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util::{round_upto_power_of_2, set_bit_raw, unset_bit_raw};
+use datafusion_common::cast::{
+    as_binary_array, as_date32_array, as_date64_array, as_string_array,
+};
 use datafusion_common::Result;
 use std::cmp::max;
 use std::sync::Arc;
@@ -53,7 +56,7 @@ pub fn write_batch_unchecked(
     offsets
 }
 
-/// bench interpreted version write
+/// Bench interpreted version write
 #[inline(never)]
 pub fn bench_write_batch(
     batches: &[Vec<RecordBatch>],
@@ -97,7 +100,7 @@ macro_rules! fn_set_idx {
     };
 }
 
-/// Reusable row writer backed by Vec<u8>
+/// Reusable row writer backed by `Vec<u8>`
 ///
 /// ```text
 ///                             ┌ ─ ─ ─ ─ ─ ─ ─ ─
@@ -117,7 +120,7 @@ macro_rules! fn_set_idx {
 pub struct RowWriter {
     /// Layout on how to write each field
     layout: RowLayout,
-    /// buffer for the current tuple been written.
+    /// Buffer for the current tuple being written.
     data: Vec<u8>,
     /// Length in bytes for the current tuple, 8-bytes word aligned.
     pub(crate) row_width: usize,
@@ -128,7 +131,7 @@ pub struct RowWriter {
 }
 
 impl RowWriter {
-    /// new
+    /// New
     pub fn new(schema: &Schema, row_type: RowType) -> Self {
         let layout = RowLayout::new(schema, row_type);
         let init_capacity = estimate_row_width(schema, &layout);
@@ -326,8 +329,10 @@ pub(crate) fn write_field_date32(
     col_idx: usize,
     row_idx: usize,
 ) {
-    let from = from.as_any().downcast_ref::<Date32Array>().unwrap();
-    to.set_date32(col_idx, from.value(row_idx));
+    match as_date32_array(from) {
+        Ok(from) => to.set_date32(col_idx, from.value(row_idx)),
+        Err(e) => panic!("{}", e),
+    };
 }
 
 pub(crate) fn write_field_date64(
@@ -336,7 +341,7 @@ pub(crate) fn write_field_date64(
     col_idx: usize,
     row_idx: usize,
 ) {
-    let from = from.as_any().downcast_ref::<Date64Array>().unwrap();
+    let from = as_date64_array(from).unwrap();
     to.set_date64(col_idx, from.value(row_idx));
 }
 
@@ -346,7 +351,7 @@ pub(crate) fn write_field_utf8(
     col_idx: usize,
     row_idx: usize,
 ) {
-    let from = from.as_any().downcast_ref::<StringArray>().unwrap();
+    let from = as_string_array(from).unwrap();
     let s = from.value(row_idx);
     let new_width = to.current_width() + s.as_bytes().len();
     if new_width > to.data.len() {
@@ -361,7 +366,7 @@ pub(crate) fn write_field_binary(
     col_idx: usize,
     row_idx: usize,
 ) {
-    let from = from.as_any().downcast_ref::<BinaryArray>().unwrap();
+    let from = as_binary_array(from).unwrap();
     let s = from.value(row_idx);
     let new_width = to.current_width() + s.len();
     if new_width > to.data.len() {

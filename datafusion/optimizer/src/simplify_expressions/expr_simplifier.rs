@@ -18,7 +18,9 @@
 //! Expression simplification API
 
 use super::utils::*;
-use crate::type_coercion::TypeCoercionRewriter;
+use crate::{
+    simplify_expressions::regex::simplify_regex_expr, type_coercion::TypeCoercionRewriter,
+};
 use arrow::{
     array::new_null_array,
     datatypes::{DataType, Field, Schema},
@@ -40,10 +42,14 @@ pub struct ExprSimplifier<S> {
     info: S,
 }
 
+const THRESHOLD_INLINE_INLIST: usize = 3;
+
 impl<S: SimplifyInfo> ExprSimplifier<S> {
     /// Create a new `ExprSimplifier` with the given `info` such as an
     /// instance of [`SimplifyContext`]. See
     /// [`simplify`](Self::simplify) for an example.
+    ///
+    /// [`SimplifyContext`]: crate::simplify_expressions::context::SimplifyContext
     pub fn new(info: S) -> Self {
         Self { info }
     }
@@ -139,8 +145,8 @@ impl<S: SimplifyInfo> ExprSimplifier<S> {
 /// Note it does not handle algebraic rewrites such as `(a or false)`
 /// --> `a`, which is handled by [`Simplifier`]
 struct ConstEvaluator<'a> {
-    /// can_evaluate is used during the depth-first-search of the
-    /// Expr tree to track if any siblings (or their descendants) were
+    /// `can_evaluate` is used during the depth-first-search of the
+    /// `Expr` tree to track if any siblings (or their descendants) were
     /// non evaluatable (e.g. had a column reference or volatile
     /// function)
     ///
@@ -148,9 +154,9 @@ struct ConstEvaluator<'a> {
     /// traversal when we are N levels deep in the tree, one entry for
     /// this Expr and each of its parents.
     ///
-    /// After visiting all siblings if can_evauate.top() is true, that
+    /// After visiting all siblings if `can_evauate.top()`` is true, that
     /// means there were no non evaluatable siblings (or their
-    /// descendants) so this Expr can be evaluated
+    /// descendants) so this `Expr` can be evaluated
     can_evaluate: Vec<bool>,
 
     execution_props: &'a ExecutionProps,
@@ -251,7 +257,8 @@ impl<'a> ConstEvaluator<'a> {
             | Expr::Sort { .. }
             | Expr::GroupingSet(_)
             | Expr::Wildcard
-            | Expr::QualifiedWildcard { .. } => false,
+            | Expr::QualifiedWildcard { .. }
+            | Expr::Placeholder { .. } => false,
             Expr::ScalarFunction { fun, .. } => Self::volatility_ok(fun.volatility()),
             Expr::ScalarUDF { fun, .. } => Self::volatility_ok(fun.signature.volatility),
             Expr::Literal(_)
@@ -329,7 +336,10 @@ impl<'a, S> Simplifier<'a, S> {
 impl<'a, S: SimplifyInfo> ExprRewriter for Simplifier<'a, S> {
     /// rewrite the expression simplifying any constant expressions
     fn mutate(&mut self, expr: Expr) -> Result<Expr> {
-        use datafusion_expr::Operator::{And, Divide, Eq, Modulo, Multiply, NotEq, Or};
+        use datafusion_expr::Operator::{
+            And, Divide, Eq, Modulo, Multiply, NotEq, Or, RegexIMatch, RegexMatch,
+            RegexNotIMatch, RegexNotMatch,
+        };
 
         let info = self.info;
         let new_expr = match expr {
@@ -365,7 +375,48 @@ impl<'a, S: SimplifyInfo> ExprRewriter for Simplifier<'a, S> {
                     None => lit_bool_null(),
                 }
             }
+            // expr IN () --> false
+            // expr NOT IN () --> true
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } if list.is_empty() && *expr != Expr::Literal(ScalarValue::Null) => {
+                lit(negated)
+            }
 
+            // if expr is a single column reference:
+            // expr IN (A, B, ...) --> (expr = A) OR (expr = B) OR (expr = C)
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } if !list.is_empty()
+                && (
+                    // For lists with only 1 value we allow more complex expressions to be simplified
+                    // e.g SUBSTR(c1, 2, 3) IN ('1') -> SUBSTR(c1, 2, 3) = '1'
+                    // for more than one we avoid repeating this potentially expensive
+                    // expressions
+                    list.len() == 1
+                        || list.len() <= THRESHOLD_INLINE_INLIST
+                            && expr.try_into_col().is_ok()
+                ) =>
+            {
+                let first_val = list[0].clone();
+                if negated {
+                    list.into_iter()
+                        .skip(1)
+                        .fold((*expr.clone()).not_eq(first_val), |acc, y| {
+                            (*expr.clone()).not_eq(y).and(acc)
+                        })
+                } else {
+                    list.into_iter()
+                        .skip(1)
+                        .fold((*expr.clone()).eq(first_val), |acc, y| {
+                            (*expr.clone()).eq(y).or(acc)
+                        })
+                }
+            }
             //
             // Rules for NotEq
             //
@@ -427,6 +478,22 @@ impl<'a, S: SimplifyInfo> ExprRewriter for Simplifier<'a, S> {
                 op: Or,
                 right,
             }) if is_false(&right) => *left,
+            // A OR !A ---> true (if A not nullable)
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Or,
+                right,
+            }) if is_not_of(&right, &left) && !info.nullable(&left)? => {
+                Expr::Literal(ScalarValue::Boolean(Some(true)))
+            }
+            // !A OR A ---> true (if A not nullable)
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Or,
+                right,
+            }) if is_not_of(&left, &right) && !info.nullable(&right)? => {
+                Expr::Literal(ScalarValue::Boolean(Some(true)))
+            }
             // (..A..) OR A --> (..A..)
             Expr::BinaryExpr(BinaryExpr {
                 left,
@@ -480,6 +547,22 @@ impl<'a, S: SimplifyInfo> ExprRewriter for Simplifier<'a, S> {
                 op: And,
                 right,
             }) if is_false(&right) => *right,
+            // A AND !A ---> false (if A not nullable)
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: And,
+                right,
+            }) if is_not_of(&right, &left) && !info.nullable(&left)? => {
+                Expr::Literal(ScalarValue::Boolean(Some(false)))
+            }
+            // !A AND A ---> false (if A not nullable)
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: And,
+                right,
+            }) if is_not_of(&left, &right) && !info.nullable(&right)? => {
+                Expr::Literal(ScalarValue::Boolean(Some(false)))
+            }
             // (..A..) AND A --> (..A..)
             Expr::BinaryExpr(BinaryExpr {
                 left,
@@ -703,10 +786,18 @@ impl<'a, S: SimplifyInfo> ExprRewriter for Simplifier<'a, S> {
                     )
                 }
             }
-            expr => {
-                // no additional rewrites possible
-                expr
-            }
+
+            //
+            // Rules for regexes
+            //
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: op @ (RegexMatch | RegexNotMatch | RegexIMatch | RegexNotIMatch),
+                right,
+            }) => simplify_regex_expr(left, op, right)?,
+
+            // no additional rewrites possible
+            expr => expr,
         };
         Ok(new_expr)
     }
@@ -727,7 +818,7 @@ mod tests {
         datatypes::{DataType, Field, Schema},
     };
     use chrono::{DateTime, TimeZone, Utc};
-    use datafusion_common::{DFField, ToDFSchema};
+    use datafusion_common::{assert_contains, cast::as_int32_array, DFField, ToDFSchema};
     use datafusion_expr::*;
     use datafusion_physical_expr::{
         execution_props::ExecutionProps, functions::make_scalar_function,
@@ -833,8 +924,7 @@ mod tests {
 
         assert_eq!(
             evaluated_expr, expected_expr,
-            "Mismatch evaluating {}\n  Expected:{}\n  Got:{}",
-            input_expr, expected_expr, evaluated_expr
+            "Mismatch evaluating {input_expr}\n  Expected:{expected_expr}\n  Got:{evaluated_expr}"
         );
     }
 
@@ -848,14 +938,8 @@ mod tests {
         let return_type = Arc::new(DataType::Int32);
 
         let fun = |args: &[ArrayRef]| {
-            let arg0 = &args[0]
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("cast failed");
-            let arg1 = &args[1]
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("cast failed");
+            let arg0 = as_int32_array(&args[0])?;
+            let arg1 = as_int32_array(&args[1])?;
 
             // 2. perform the computation
             let array = arg0
@@ -926,11 +1010,6 @@ mod tests {
         let expr =
             call_fn("to_timestamp", vec![lit("2020-09-08T12:00:00+00:00")]).unwrap();
         test_evaluate(expr, lit_timestamp_nano(1599566400000000000i64));
-
-        // check that non foldable arguments are folded
-        // to_timestamp(a) --> to_timestamp(a) [no rewrite possible]
-        let expr = call_fn("to_timestamp", vec![col("a")]).unwrap();
-        test_evaluate(expr.clone(), expr);
 
         // check that non foldable arguments are folded
         // to_timestamp(a) --> to_timestamp(a) [no rewrite possible]
@@ -1041,6 +1120,18 @@ mod tests {
     }
 
     #[test]
+    fn test_simplify_or_not_self() {
+        // A OR !A if A is not nullable --> true
+        // !A OR A if A is not nullable --> true
+        let expr_a = col("c2_non_null").or(col("c2_non_null").not());
+        let expr_b = col("c2_non_null").not().or(col("c2_non_null"));
+        let expected = lit(true);
+
+        assert_eq!(simplify(expr_a), expected);
+        assert_eq!(simplify(expr_b), expected);
+    }
+
+    #[test]
     fn test_simplify_and_false() {
         let expr_a = lit(false).and(col("c2"));
         let expr_b = col("c2").and(lit(false));
@@ -1063,6 +1154,18 @@ mod tests {
         let expr_a = lit(true).and(col("c2"));
         let expr_b = col("c2").and(lit(true));
         let expected = col("c2");
+
+        assert_eq!(simplify(expr_a), expected);
+        assert_eq!(simplify(expr_b), expected);
+    }
+
+    #[test]
+    fn test_simplify_and_not_self() {
+        // A AND !A if A is not nullable --> false
+        // !A AND A if A is not nullable --> false
+        let expr_a = col("c2_non_null").and(col("c2_non_null").not());
+        let expr_b = col("c2_non_null").not().and(col("c2_non_null"));
+        let expected = lit(false);
 
         assert_eq!(simplify(expr_a), expected);
         assert_eq!(simplify(expr_b), expected);
@@ -1487,17 +1590,168 @@ mod tests {
         assert_eq!(simplify(expr), expected)
     }
 
+    #[test]
+    fn test_simplify_regex() {
+        // malformed regex
+        assert_contains!(
+            try_simplify(regex_match(col("c1"), lit("foo{")))
+                .unwrap_err()
+                .to_string(),
+            "regex parse error"
+        );
+
+        // unsupported cases
+        assert_no_change(regex_match(col("c1"), lit("foo.*")));
+        assert_no_change(regex_match(col("c1"), lit("(foo)")));
+        assert_no_change(regex_match(col("c1"), lit("^foo")));
+        assert_no_change(regex_match(col("c1"), lit("foo$")));
+        assert_no_change(regex_match(col("c1"), lit("%")));
+        assert_no_change(regex_match(col("c1"), lit("_")));
+        assert_no_change(regex_match(col("c1"), lit("f%o")));
+        assert_no_change(regex_match(col("c1"), lit("f_o")));
+
+        // empty cases
+        assert_change(regex_match(col("c1"), lit("")), like(col("c1"), "%"));
+        assert_change(
+            regex_not_match(col("c1"), lit("")),
+            not_like(col("c1"), "%"),
+        );
+        assert_change(regex_imatch(col("c1"), lit("")), ilike(col("c1"), "%"));
+        assert_change(
+            regex_not_imatch(col("c1"), lit("")),
+            not_ilike(col("c1"), "%"),
+        );
+
+        // single character
+        assert_change(regex_match(col("c1"), lit("x")), like(col("c1"), "%x%"));
+
+        // single word
+        assert_change(regex_match(col("c1"), lit("foo")), like(col("c1"), "%foo%"));
+
+        // OR-chain
+        assert_change(
+            regex_match(col("c1"), lit("foo|bar|baz")),
+            like(col("c1"), "%foo%")
+                .or(like(col("c1"), "%bar%"))
+                .or(like(col("c1"), "%baz%")),
+        );
+        assert_change(
+            regex_match(col("c1"), lit("foo|x|baz")),
+            like(col("c1"), "%foo%")
+                .or(like(col("c1"), "%x%"))
+                .or(like(col("c1"), "%baz%")),
+        );
+        assert_change(
+            regex_match(col("c1"), lit("foo||baz")),
+            like(col("c1"), "%foo%")
+                .or(like(col("c1"), "%"))
+                .or(like(col("c1"), "%baz%")),
+        );
+        assert_change(
+            regex_not_match(col("c1"), lit("foo|bar|baz")),
+            not_like(col("c1"), "%foo%")
+                .and(not_like(col("c1"), "%bar%"))
+                .and(not_like(col("c1"), "%baz%")),
+        );
+        // Too many patterns (MAX_REGEX_ALTERNATIONS_EXPANSION)
+        assert_no_change(regex_match(col("c1"), lit("foo|bar|baz|blarg|bozo|etc")));
+    }
+
+    #[track_caller]
+    fn assert_no_change(expr: Expr) {
+        let optimized = simplify(expr.clone());
+        assert_eq!(expr, optimized);
+    }
+
+    #[track_caller]
+    fn assert_change(expr: Expr, expected: Expr) {
+        let optimized = simplify(expr);
+        assert_eq!(optimized, expected);
+    }
+
+    fn regex_match(left: Expr, right: Expr) -> Expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(left),
+            op: Operator::RegexMatch,
+            right: Box::new(right),
+        })
+    }
+
+    fn regex_not_match(left: Expr, right: Expr) -> Expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(left),
+            op: Operator::RegexNotMatch,
+            right: Box::new(right),
+        })
+    }
+
+    fn regex_imatch(left: Expr, right: Expr) -> Expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(left),
+            op: Operator::RegexIMatch,
+            right: Box::new(right),
+        })
+    }
+
+    fn regex_not_imatch(left: Expr, right: Expr) -> Expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(left),
+            op: Operator::RegexNotIMatch,
+            right: Box::new(right),
+        })
+    }
+
+    fn like(expr: Expr, pattern: &str) -> Expr {
+        Expr::Like(Like {
+            negated: false,
+            expr: Box::new(expr),
+            pattern: Box::new(lit(pattern)),
+            escape_char: None,
+        })
+    }
+
+    fn not_like(expr: Expr, pattern: &str) -> Expr {
+        Expr::Like(Like {
+            negated: true,
+            expr: Box::new(expr),
+            pattern: Box::new(lit(pattern)),
+            escape_char: None,
+        })
+    }
+
+    fn ilike(expr: Expr, pattern: &str) -> Expr {
+        Expr::ILike(Like {
+            negated: false,
+            expr: Box::new(expr),
+            pattern: Box::new(lit(pattern)),
+            escape_char: None,
+        })
+    }
+
+    fn not_ilike(expr: Expr, pattern: &str) -> Expr {
+        Expr::ILike(Like {
+            negated: true,
+            expr: Box::new(expr),
+            pattern: Box::new(lit(pattern)),
+            escape_char: None,
+        })
+    }
+
     // ------------------------------
     // ----- Simplifier tests -------
     // ------------------------------
 
-    fn simplify(expr: Expr) -> Expr {
+    fn try_simplify(expr: Expr) -> Result<Expr> {
         let schema = expr_test_schema();
         let execution_props = ExecutionProps::new();
         let simplifier = ExprSimplifier::new(
             SimplifyContext::new(&execution_props).with_schema(schema),
         );
-        simplifier.simplify(expr).unwrap()
+        simplifier.simplify(expr)
+    }
+
+    fn simplify(expr: Expr) -> Expr {
+        try_simplify(expr).unwrap()
     }
 
     fn expr_test_schema() -> DFSchemaRef {
@@ -1747,6 +2001,37 @@ mod tests {
             lit_bool_null(),
         );
         assert_eq!(expected_expr, result);
+    }
+
+    #[test]
+    fn simplify_inlist() {
+        assert_eq!(simplify(in_list(col("c1"), vec![], false)), lit(false));
+        assert_eq!(simplify(in_list(col("c1"), vec![], true)), lit(true));
+
+        assert_eq!(
+            simplify(in_list(col("c1"), vec![lit(1)], false)),
+            col("c1").eq(lit(1))
+        );
+        assert_eq!(
+            simplify(in_list(col("c1"), vec![lit(1)], true)),
+            col("c1").not_eq(lit(1))
+        );
+
+        // more complex expressions can be simplified if list contains
+        // one element only
+        assert_eq!(
+            simplify(in_list(col("c1") * lit(10), vec![lit(2)], false)),
+            (col("c1") * lit(10)).eq(lit(2))
+        );
+
+        assert_eq!(
+            simplify(in_list(col("c1"), vec![lit(1), lit(2)], false)),
+            col("c1").eq(lit(2)).or(col("c1").eq(lit(1)))
+        );
+        assert_eq!(
+            simplify(in_list(col("c1"), vec![lit(1), lit(2)], true)),
+            col("c1").not_eq(lit(2)).and(col("c1").not_eq(lit(1)))
+        );
     }
 
     #[test]

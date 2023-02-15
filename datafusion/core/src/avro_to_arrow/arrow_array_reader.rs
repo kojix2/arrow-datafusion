@@ -97,12 +97,10 @@ impl<'a, R: Read> AvroArrowArrayReader<'a, R> {
             .map(|value| match value {
                 Ok(Value::Record(v)) => Ok(v),
                 Err(e) => Err(ArrowError::ParseError(format!(
-                    "Failed to parse avro value: {:?}",
-                    e
+                    "Failed to parse avro value: {e:?}"
                 ))),
                 other => Err(ArrowError::ParseError(format!(
-                    "Row needs to be of type object, got: {:?}",
-                    other
+                    "Row needs to be of type object, got: {other:?}"
                 ))),
             })
             .collect::<ArrowResult<Vec<Vec<(String, Value)>>>>()?;
@@ -237,8 +235,7 @@ impl<'a, R: Read> AvroArrowArrayReader<'a, R> {
                 self.list_array_string_array_builder::<UInt64Type>(&dtype, col_name, rows)
             }
             ref e => Err(SchemaError(format!(
-                "Data type is currently not supported for dictionaries in list : {:?}",
-                e
+                "Data type is currently not supported for dictionaries in list : {e:?}"
             ))),
         }
     }
@@ -265,8 +262,7 @@ impl<'a, R: Read> AvroArrowArrayReader<'a, R> {
             }
             e => {
                 return Err(SchemaError(format!(
-                    "Nested list data builder type is not supported: {:?}",
-                    e
+                    "Nested list data builder type is not supported: {e:?}"
                 )))
             }
         };
@@ -331,8 +327,7 @@ impl<'a, R: Read> AvroArrowArrayReader<'a, R> {
                     }
                     e => {
                         return Err(SchemaError(format!(
-                            "Nested list data builder type is not supported: {:?}",
-                            e
+                            "Nested list data builder type is not supported: {e:?}"
                         )))
                     }
                 }
@@ -564,8 +559,7 @@ impl<'a, R: Read> AvroArrowArrayReader<'a, R> {
             }
             datatype => {
                 return Err(ArrowError::SchemaError(format!(
-                    "Nested list of {:?} not supported",
-                    datatype
+                    "Nested list of {datatype:?} not supported"
                 )));
             }
         };
@@ -673,8 +667,7 @@ impl<'a, R: Read> AvroArrowArrayReader<'a, R> {
                             ),
                         t => {
                             return Err(ArrowError::SchemaError(format!(
-                                "TimeUnit {:?} not supported with Time64",
-                                t
+                                "TimeUnit {t:?} not supported with Time64"
                             )))
                         }
                     },
@@ -691,8 +684,7 @@ impl<'a, R: Read> AvroArrowArrayReader<'a, R> {
                             ),
                         t => {
                             return Err(ArrowError::SchemaError(format!(
-                                "TimeUnit {:?} not supported with Time32",
-                                t
+                                "TimeUnit {t:?} not supported with Time32"
                             )))
                         }
                     },
@@ -755,7 +747,7 @@ impl<'a, R: Read> AvroArrowArrayReader<'a, R> {
                                     bit_util::set_bit(null_buffer.as_slice_mut(), i);
                                     value
                                 } else {
-                                    panic!("expected struct got {:?}", v);
+                                    panic!("expected struct got {v:?}");
                                 }
                             })
                             .collect::<Vec<&Vec<(String, Value)>>>();
@@ -877,7 +869,7 @@ fn resolve_string(v: &Value) -> ArrowResult<String> {
         }
         other => Err(AvroError::GetString(other.into())),
     }
-    .map_err(|e| SchemaError(format!("expected resolvable string : {:?}", e)))
+    .map_err(|e| SchemaError(format!("expected resolvable string : {e:?}")))
 }
 
 fn resolve_u8(v: &Value) -> AvroResult<u8> {
@@ -904,7 +896,7 @@ fn resolve_bytes(v: &Value) -> Option<Vec<u8>> {
             items
                 .iter()
                 .map(resolve_u8)
-                .collect::<std::result::Result<Vec<_>, _>>()
+                .collect::<Result<Vec<_>, _>>()
                 .ok()?,
         )),
         other => Err(AvroError::GetBytes(other.into())),
@@ -975,13 +967,15 @@ mod test {
     use crate::arrow::array::Array;
     use crate::arrow::datatypes::{Field, TimeUnit};
     use crate::avro_to_arrow::{Reader, ReaderBuilder};
-    use arrow::array::{Int32Array, Int64Array, ListArray, TimestampMicrosecondArray};
     use arrow::datatypes::DataType;
+    use datafusion_common::cast::{
+        as_int32_array, as_int64_array, as_list_array, as_timestamp_microsecond_array,
+    };
     use std::fs::File;
 
     fn build_reader(name: &str, batch_size: usize) -> Reader<File> {
         let testdata = crate::test_util::arrow_test_data();
-        let filename = format!("{}/avro/{}", testdata, name);
+        let filename = format!("{testdata}/avro/{name}");
         let builder = ReaderBuilder::new()
             .read_schema()
             .with_batch_size(batch_size);
@@ -1007,11 +1001,8 @@ mod test {
             &DataType::Timestamp(TimeUnit::Microsecond, None),
             timestamp_col.1.data_type()
         );
-        let timestamp_array = batch
-            .column(timestamp_col.0)
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap();
+        let timestamp_array =
+            as_timestamp_microsecond_array(batch.column(timestamp_col.0)).unwrap();
         for i in 0..timestamp_array.len() {
             assert!(timestamp_array.is_valid(i));
         }
@@ -1033,11 +1024,7 @@ mod test {
         let batch = reader.next().unwrap().unwrap();
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(batch.num_rows(), 3);
-        let a_array = batch
-            .column(col_id_index)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
+        let a_array = as_list_array(batch.column(col_id_index)).unwrap();
         assert_eq!(
             *a_array.data_type(),
             DataType::List(Box::new(Field::new("bigint", DataType::Int64, true)))
@@ -1047,9 +1034,7 @@ mod test {
 
         assert_eq!(
             6,
-            array
-                .as_any()
-                .downcast_ref::<Int64Array>()
+            as_int64_array(&array)
                 .unwrap()
                 .iter()
                 .flatten()
@@ -1080,11 +1065,7 @@ mod test {
             num_batches += 1;
             let batch_schema = batch.schema();
             assert_eq!(schema, batch_schema);
-            let a_array = batch
-                .column(col_id_index)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap();
+            let a_array = as_int32_array(batch.column(col_id_index)).unwrap();
             sum_id += (0..a_array.len()).map(|i| a_array.value(i)).sum::<i32>();
         }
         assert_eq!(8, sum_num_rows);

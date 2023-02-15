@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! In-memory data source for presenting a Vec<RecordBatch> as a data source that can be
+//! In-memory data source for presenting a `Vec<RecordBatch>` as a data source that can be
 //! queried by DataFusion. This allows data to be pre-loaded into memory and then
 //! repeatedly queried without incurring additional file I/O overhead.
 
@@ -29,14 +29,16 @@ use async_trait::async_trait;
 
 use crate::datasource::{TableProvider, TableType};
 use crate::error::{DataFusionError, Result};
-use crate::execution::context::{SessionState, TaskContext};
+use crate::execution::context::SessionState;
 use crate::logical_expr::Expr;
 use crate::physical_plan::common;
+use crate::physical_plan::common::AbortOnDropSingle;
 use crate::physical_plan::memory::MemoryExec;
 use crate::physical_plan::ExecutionPlan;
 use crate::physical_plan::{repartition::RepartitionExec, Partitioning};
 
 /// In-memory table
+#[derive(Debug)]
 pub struct MemTable {
     schema: SchemaRef,
     batches: Vec<Vec<RecordBatch>>,
@@ -65,20 +67,22 @@ impl MemTable {
     pub async fn load(
         t: Arc<dyn TableProvider>,
         output_partitions: Option<usize>,
-        ctx: &SessionState,
+        state: &SessionState,
     ) -> Result<Self> {
         let schema = t.schema();
-        let exec = t.scan(ctx, &None, &[], None).await?;
+        let exec = t.scan(state, None, &[], None).await?;
         let partition_count = exec.output_partitioning().partition_count();
 
         let tasks = (0..partition_count)
             .map(|part_i| {
-                let task = Arc::new(TaskContext::from(ctx));
+                let task = state.task_ctx();
                 let exec = exec.clone();
-                tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     let stream = exec.execute(part_i, task)?;
                     common::collect(stream).await
-                })
+                });
+
+                AbortOnDropSingle::new(task)
             })
             // this collect *is needed* so that the join below can
             // switch between tasks
@@ -86,9 +90,9 @@ impl MemTable {
 
         let mut data: Vec<Vec<RecordBatch>> =
             Vec::with_capacity(exec.output_partitioning().partition_count());
-        for task in tasks {
-            let result = task.await.expect("MemTable::load could not join task")?;
-            data.push(result);
+
+        for result in futures::future::join_all(tasks).await {
+            data.push(result.map_err(|e| DataFusionError::External(Box::new(e)))??)
         }
 
         let exec = MemoryExec::try_new(&data, schema.clone(), None)?;
@@ -103,7 +107,7 @@ impl MemTable {
             let mut output_partitions = vec![];
             for i in 0..exec.output_partitioning().partition_count() {
                 // execute this *output* partition and collect all batches
-                let task_ctx = Arc::new(TaskContext::from(ctx));
+                let task_ctx = state.task_ctx();
                 let mut stream = exec.execute(i, task_ctx)?;
                 let mut batches = vec![];
                 while let Some(result) = stream.next().await {
@@ -134,15 +138,15 @@ impl TableProvider for MemTable {
 
     async fn scan(
         &self,
-        _ctx: &SessionState,
-        projection: &Option<Vec<usize>>,
+        _state: &SessionState,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(MemoryExec::try_new(
             &self.batches.clone(),
             self.schema(),
-            projection.clone(),
+            projection.cloned(),
         )?))
     }
 }
@@ -172,9 +176,9 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int32Array::from_slice(&[1, 2, 3])),
-                Arc::new(Int32Array::from_slice(&[4, 5, 6])),
-                Arc::new(Int32Array::from_slice(&[7, 8, 9])),
+                Arc::new(Int32Array::from_slice([1, 2, 3])),
+                Arc::new(Int32Array::from_slice([4, 5, 6])),
+                Arc::new(Int32Array::from_slice([7, 8, 9])),
                 Arc::new(Int32Array::from(vec![None, None, Some(9)])),
             ],
         )?;
@@ -183,7 +187,7 @@ mod tests {
 
         // scan with projection
         let exec = provider
-            .scan(&session_ctx.state(), &Some(vec![2, 1]), &[], None)
+            .scan(&session_ctx.state(), Some(&vec![2, 1]), &[], None)
             .await?;
 
         let mut it = exec.execute(0, task_ctx)?;
@@ -209,17 +213,15 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int32Array::from_slice(&[1, 2, 3])),
-                Arc::new(Int32Array::from_slice(&[4, 5, 6])),
-                Arc::new(Int32Array::from_slice(&[7, 8, 9])),
+                Arc::new(Int32Array::from_slice([1, 2, 3])),
+                Arc::new(Int32Array::from_slice([4, 5, 6])),
+                Arc::new(Int32Array::from_slice([7, 8, 9])),
             ],
         )?;
 
         let provider = MemTable::try_new(schema, vec![vec![batch]])?;
 
-        let exec = provider
-            .scan(&session_ctx.state(), &None, &[], None)
-            .await?;
+        let exec = provider.scan(&session_ctx.state(), None, &[], None).await?;
         let mut it = exec.execute(0, task_ctx)?;
         let batch1 = it.next().await.unwrap()?;
         assert_eq!(3, batch1.schema().fields().len());
@@ -241,9 +243,9 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int32Array::from_slice(&[1, 2, 3])),
-                Arc::new(Int32Array::from_slice(&[4, 5, 6])),
-                Arc::new(Int32Array::from_slice(&[7, 8, 9])),
+                Arc::new(Int32Array::from_slice([1, 2, 3])),
+                Arc::new(Int32Array::from_slice([4, 5, 6])),
+                Arc::new(Int32Array::from_slice([7, 8, 9])),
             ],
         )?;
 
@@ -252,16 +254,16 @@ mod tests {
         let projection: Vec<usize> = vec![0, 4];
 
         match provider
-            .scan(&session_ctx.state(), &Some(projection), &[], None)
+            .scan(&session_ctx.state(), Some(&projection), &[], None)
             .await
         {
             Err(DataFusionError::ArrowError(ArrowError::SchemaError(e))) => {
                 assert_eq!(
                     "\"project index 4 out of bounds, max field 3\"",
-                    format!("{:?}", e)
+                    format!("{e:?}")
                 )
             }
-            res => panic!("Scan should failed on invalid projection, got {:?}", res),
+            res => panic!("Scan should failed on invalid projection, got {res:?}"),
         };
 
         Ok(())
@@ -284,17 +286,16 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema1,
             vec![
-                Arc::new(Int32Array::from_slice(&[1, 2, 3])),
-                Arc::new(Int32Array::from_slice(&[4, 5, 6])),
-                Arc::new(Int32Array::from_slice(&[7, 8, 9])),
+                Arc::new(Int32Array::from_slice([1, 2, 3])),
+                Arc::new(Int32Array::from_slice([4, 5, 6])),
+                Arc::new(Int32Array::from_slice([7, 8, 9])),
             ],
         )?;
 
         match MemTable::try_new(schema2, vec![vec![batch]]) {
-            Err(DataFusionError::Plan(e)) => assert_eq!(
-                "\"Mismatch between schema and batches\"",
-                format!("{:?}", e)
-            ),
+            Err(DataFusionError::Plan(e)) => {
+                assert_eq!("\"Mismatch between schema and batches\"", format!("{e:?}"))
+            }
             _ => panic!("MemTable::new should have failed due to schema mismatch"),
         }
 
@@ -317,16 +318,15 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema1,
             vec![
-                Arc::new(Int32Array::from_slice(&[1, 2, 3])),
-                Arc::new(Int32Array::from_slice(&[7, 5, 9])),
+                Arc::new(Int32Array::from_slice([1, 2, 3])),
+                Arc::new(Int32Array::from_slice([7, 5, 9])),
             ],
         )?;
 
         match MemTable::try_new(schema2, vec![vec![batch]]) {
-            Err(DataFusionError::Plan(e)) => assert_eq!(
-                "\"Mismatch between schema and batches\"",
-                format!("{:?}", e)
-            ),
+            Err(DataFusionError::Plan(e)) => {
+                assert_eq!("\"Mismatch between schema and batches\"", format!("{e:?}"))
+            }
             _ => panic!("MemTable::new should have failed due to schema mismatch"),
         }
 
@@ -362,27 +362,25 @@ mod tests {
         let batch1 = RecordBatch::try_new(
             Arc::new(schema1),
             vec![
-                Arc::new(Int32Array::from_slice(&[1, 2, 3])),
-                Arc::new(Int32Array::from_slice(&[4, 5, 6])),
-                Arc::new(Int32Array::from_slice(&[7, 8, 9])),
+                Arc::new(Int32Array::from_slice([1, 2, 3])),
+                Arc::new(Int32Array::from_slice([4, 5, 6])),
+                Arc::new(Int32Array::from_slice([7, 8, 9])),
             ],
         )?;
 
         let batch2 = RecordBatch::try_new(
             Arc::new(schema2),
             vec![
-                Arc::new(Int32Array::from_slice(&[1, 2, 3])),
-                Arc::new(Int32Array::from_slice(&[4, 5, 6])),
-                Arc::new(Int32Array::from_slice(&[7, 8, 9])),
+                Arc::new(Int32Array::from_slice([1, 2, 3])),
+                Arc::new(Int32Array::from_slice([4, 5, 6])),
+                Arc::new(Int32Array::from_slice([7, 8, 9])),
             ],
         )?;
 
         let provider =
             MemTable::try_new(Arc::new(merged_schema), vec![vec![batch1, batch2]])?;
 
-        let exec = provider
-            .scan(&session_ctx.state(), &None, &[], None)
-            .await?;
+        let exec = provider.scan(&session_ctx.state(), None, &[], None).await?;
         let mut it = exec.execute(0, task_ctx)?;
         let batch1 = it.next().await.unwrap()?;
         assert_eq!(3, batch1.schema().fields().len());

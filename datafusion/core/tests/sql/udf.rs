@@ -21,14 +21,15 @@ use datafusion::{
     execution::registry::FunctionRegistry,
     physical_plan::{expressions::AvgAccumulator, functions::make_scalar_function},
 };
-use datafusion_expr::{create_udaf, LogicalPlanBuilder};
+use datafusion_common::{cast::as_int32_array, ScalarValue};
+use datafusion_expr::{create_udaf, Accumulator, LogicalPlanBuilder};
 
 /// test that casting happens on udfs.
 /// c11 is f32, but `custom_sqrt` requires f64. Casting happens but the logical plan and
 /// physical plan have the same schema.
 #[tokio::test]
 async fn csv_query_custom_udf_with_cast() -> Result<()> {
-    let ctx = create_ctx()?;
+    let ctx = create_ctx();
     register_aggregate_csv(&ctx).await?;
     let sql = "SELECT avg(custom_sqrt(c11)) FROM aggregate_test_100";
     let actual = execute(&ctx, sql).await;
@@ -47,24 +48,18 @@ async fn scalar_udf() -> Result<()> {
     let batch = RecordBatch::try_new(
         Arc::new(schema.clone()),
         vec![
-            Arc::new(Int32Array::from_slice(&[1, 10, 10, 100])),
-            Arc::new(Int32Array::from_slice(&[2, 12, 12, 120])),
+            Arc::new(Int32Array::from_slice([1, 10, 10, 100])),
+            Arc::new(Int32Array::from_slice([2, 12, 12, 120])),
         ],
     )?;
 
-    let mut ctx = SessionContext::new();
+    let ctx = SessionContext::new();
 
     ctx.register_batch("t", batch)?;
 
     let myfunc = |args: &[ArrayRef]| {
-        let l = &args[0]
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("cast failed");
-        let r = &args[1]
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("cast failed");
+        let l = as_int32_array(&args[0])?;
+        let r = as_int32_array(&args[1])?;
         Ok(Arc::new(add(l, r)?) as ArrayRef)
     };
     let myfunc = make_scalar_function(myfunc);
@@ -80,9 +75,9 @@ async fn scalar_udf() -> Result<()> {
     // from here on, we may be in a different scope. We would still like to be able
     // to call UDFs.
 
-    let t = ctx.table("t")?;
+    let t = ctx.table("t").await?;
 
-    let plan = LogicalPlanBuilder::from(t.to_logical_plan()?)
+    let plan = LogicalPlanBuilder::from(t.into_optimized_plan()?)
         .project(vec![
             col("a"),
             col("b"),
@@ -91,14 +86,11 @@ async fn scalar_udf() -> Result<()> {
         .build()?;
 
     assert_eq!(
-        format!("{:?}", plan),
+        format!("{plan:?}"),
         "Projection: t.a, t.b, my_add(t.a, t.b)\n  TableScan: t projection=[a, b]"
     );
 
-    let plan = ctx.optimize(&plan)?;
-    let plan = ctx.create_physical_plan(&plan).await?;
-    let task_ctx = ctx.task_ctx();
-    let result = collect(plan, task_ctx).await?;
+    let result = DataFrame::new(ctx.state(), plan).collect().await?;
 
     let expected = vec![
         "+-----+-----+-----------------+",
@@ -113,21 +105,9 @@ async fn scalar_udf() -> Result<()> {
     assert_batches_eq!(expected, &result);
 
     let batch = &result[0];
-    let a = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .expect("failed to cast a");
-    let b = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .expect("failed to cast b");
-    let sum = batch
-        .column(2)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .expect("failed to cast sum");
+    let a = as_int32_array(batch.column(0))?;
+    let b = as_int32_array(batch.column(1))?;
+    let sum = as_int32_array(batch.column(2))?;
 
     assert_eq!(4, a.len());
     assert_eq!(4, b.len());
@@ -148,14 +128,14 @@ async fn simple_udaf() -> Result<()> {
 
     let batch1 = RecordBatch::try_new(
         Arc::new(schema.clone()),
-        vec![Arc::new(Int32Array::from_slice(&[1, 2, 3]))],
+        vec![Arc::new(Int32Array::from_slice([1, 2, 3]))],
     )?;
     let batch2 = RecordBatch::try_new(
         Arc::new(schema.clone()),
-        vec![Arc::new(Int32Array::from_slice(&[4, 5]))],
+        vec![Arc::new(Int32Array::from_slice([4, 5]))],
     )?;
 
-    let mut ctx = SessionContext::new();
+    let ctx = SessionContext::new();
 
     let provider = MemTable::try_new(Arc::new(schema), vec![vec![batch1], vec![batch2]])?;
     ctx.register_table("t", Arc::new(provider))?;
@@ -183,5 +163,63 @@ async fn simple_udaf() -> Result<()> {
     ];
     assert_batches_eq!(expected, &result);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn udaf_as_window_func() -> Result<()> {
+    #[derive(Debug)]
+    struct MyAccumulator;
+
+    impl Accumulator for MyAccumulator {
+        fn state(&self) -> Result<Vec<ScalarValue>> {
+            unimplemented!()
+        }
+
+        fn update_batch(&mut self, _: &[ArrayRef]) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn merge_batch(&mut self, _: &[ArrayRef]) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn evaluate(&self) -> Result<ScalarValue> {
+            unimplemented!()
+        }
+
+        fn size(&self) -> usize {
+            unimplemented!()
+        }
+    }
+
+    let my_acc = create_udaf(
+        "my_acc",
+        DataType::Int32,
+        Arc::new(DataType::Int32),
+        Volatility::Immutable,
+        Arc::new(|_| Ok(Box::new(MyAccumulator))),
+        Arc::new(vec![DataType::Int32]),
+    );
+
+    let context = SessionContext::new();
+    context.register_table(
+        "my_table",
+        Arc::new(datafusion::datasource::empty::EmptyTable::new(Arc::new(
+            Schema::new(vec![
+                Field::new("a", DataType::UInt32, false),
+                Field::new("b", DataType::Int32, false),
+            ]),
+        ))),
+    )?;
+    context.register_udaf(my_acc);
+
+    let sql = "SELECT a, MY_ACC(b) OVER(PARTITION BY a) FROM my_table";
+    let expected = r#"Projection: my_table.a, AggregateUDF { name: "my_acc", signature: Signature { type_signature: Exact([Int32]), volatility: Immutable }, fun: "<FUNC>" }(my_table.b) PARTITION BY [my_table.a] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  WindowAggr: windowExpr=[[AggregateUDF { name: "my_acc", signature: Signature { type_signature: Exact([Int32]), volatility: Immutable }, fun: "<FUNC>" }(my_table.b) PARTITION BY [my_table.a] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]
+    TableScan: my_table"#;
+
+    let dataframe = context.sql(sql).await.unwrap();
+    assert_eq!(format!("{:?}", dataframe.logical_plan()), expected);
     Ok(())
 }

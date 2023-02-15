@@ -45,19 +45,18 @@ fn build() -> Result<(), String> {
         .compile_well_known_types()
         .extern_path(".google.protobuf", "::pbjson_types")
         .compile_protos(&["proto/datafusion.proto"], &["proto"])
-        .map_err(|e| format!("protobuf compilation failed: {}", e))?;
+        .map_err(|e| format!("protobuf compilation failed: {e}"))?;
 
     let descriptor_set = std::fs::read(&descriptor_path)
-        .expect(&*format!("Cannot read {:?}", &descriptor_path));
+        .unwrap_or_else(|e| panic!("Cannot read {:?}: {}", &descriptor_path, e));
 
     pbjson_build::Builder::new()
         .register_descriptors(&descriptor_set)
-        .expect(&*format!(
-            "Cannot register descriptors {:?}",
-            &descriptor_set
-        ))
+        .unwrap_or_else(|e| {
+            panic!("Cannot register descriptors {:?}: {}", &descriptor_set, e)
+        })
         .build(&[".datafusion"])
-        .map_err(|e| format!("pbjson compilation failed: {}", e))?;
+        .map_err(|e| format!("pbjson compilation failed: {e}"))?;
 
     let prost = out.join("datafusion.rs");
     let pbjson = out.join("datafusion.serde.rs");

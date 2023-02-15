@@ -16,8 +16,9 @@
 // under the License.
 
 //! Defines the Sort-Merge join execution plan.
-//! A sort-merge join plan consumes two sorted children plan and produces
+//! A Sort-Merge join plan consumes two sorted children plan and produces
 //! joined output by given join type and other options.
+//! Sort-Merge join feature is currently experimental.
 
 use std::any::Any;
 use std::cmp::Ordering;
@@ -29,9 +30,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow::array::*;
-use arrow::compute::{take, SortOptions};
+use arrow::compute::{concat_batches, take, SortOptions};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use arrow::error::{ArrowError, Result as ArrowResult};
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use futures::{Stream, StreamExt};
 
@@ -39,38 +40,46 @@ use crate::error::DataFusionError;
 use crate::error::Result;
 use crate::execution::context::TaskContext;
 use crate::logical_expr::JoinType;
-use crate::physical_plan::common::combine_batches;
 use crate::physical_plan::expressions::Column;
 use crate::physical_plan::expressions::PhysicalSortExpr;
 use crate::physical_plan::joins::utils::{
-    build_join_schema, check_join_is_valid, JoinOn,
+    build_join_schema, check_join_is_valid, combine_join_equivalence_properties,
+    estimate_join_statistics, partitioned_join_output_partitioning, JoinOn,
 };
 use crate::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use crate::physical_plan::{
-    metrics, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
-    SendableRecordBatchStream, Statistics,
+    metrics, DisplayFormatType, Distribution, EquivalenceProperties, ExecutionPlan,
+    Partitioning, PhysicalExpr, RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
+
+use datafusion_physical_expr::rewrite::TreeNodeRewritable;
 
 /// join execution plan executes partitions in parallel and combines them into a set of
 /// partitions.
 #[derive(Debug)]
 pub struct SortMergeJoinExec {
     /// Left sorted joining execution plan
-    left: Arc<dyn ExecutionPlan>,
+    pub(crate) left: Arc<dyn ExecutionPlan>,
     /// Right sorting joining execution plan
-    right: Arc<dyn ExecutionPlan>,
+    pub(crate) right: Arc<dyn ExecutionPlan>,
     /// Set of common columns used to join on
-    on: JoinOn,
+    pub(crate) on: JoinOn,
     /// How the join is performed
-    join_type: JoinType,
+    pub(crate) join_type: JoinType,
     /// The schema once the join is applied
     schema: SchemaRef,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
+    /// The left SortExpr
+    left_sort_exprs: Vec<PhysicalSortExpr>,
+    /// The right SortExpr
+    right_sort_exprs: Vec<PhysicalSortExpr>,
+    /// The output ordering
+    output_ordering: Option<Vec<PhysicalSortExpr>>,
     /// Sort options of join columns used in sorting left and right execution plans
-    sort_options: Vec<SortOptions>,
+    pub(crate) sort_options: Vec<SortOptions>,
     /// If null_equals_null is true, null == null else null != null
-    null_equals_null: bool,
+    pub(crate) null_equals_null: bool,
 }
 
 impl SortMergeJoinExec {
@@ -104,6 +113,64 @@ impl SortMergeJoinExec {
             )));
         }
 
+        let (left_sort_exprs, right_sort_exprs): (Vec<_>, Vec<_>) = on
+            .iter()
+            .zip(sort_options.iter())
+            .map(|((l, r), sort_op)| {
+                let left = PhysicalSortExpr {
+                    expr: Arc::new(l.clone()) as Arc<dyn PhysicalExpr>,
+                    options: *sort_op,
+                };
+                let right = PhysicalSortExpr {
+                    expr: Arc::new(r.clone()) as Arc<dyn PhysicalExpr>,
+                    options: *sort_op,
+                };
+                (left, right)
+            })
+            .unzip();
+
+        let output_ordering = match join_type {
+            JoinType::Inner
+            | JoinType::Left
+            | JoinType::LeftSemi
+            | JoinType::LeftAnti => {
+                left.output_ordering().map(|sort_exprs| sort_exprs.to_vec())
+            }
+            JoinType::RightSemi | JoinType::RightAnti => right
+                .output_ordering()
+                .map(|sort_exprs| sort_exprs.to_vec()),
+            JoinType::Right => {
+                let left_columns_len = left.schema().fields.len();
+                right
+                    .output_ordering()
+                    .map(|sort_exprs| {
+                        let new_sort_exprs: Result<Vec<PhysicalSortExpr>> = sort_exprs
+                            .iter()
+                            .map(|e| {
+                                let new_expr =
+                                    e.expr.clone().transform_down(&|e| match e
+                                        .as_any()
+                                        .downcast_ref::<Column>(
+                                    ) {
+                                        Some(col) => Ok(Some(Arc::new(Column::new(
+                                            col.name(),
+                                            left_columns_len + col.index(),
+                                        )))),
+                                        None => Ok(None),
+                                    });
+                                Ok(PhysicalSortExpr {
+                                    expr: new_expr?,
+                                    options: e.options,
+                                })
+                            })
+                            .collect();
+                        new_sort_exprs
+                    })
+                    .map_or(Ok(None), |v| v.map(Some))?
+            }
+            JoinType::Full => None,
+        };
+
         let schema =
             Arc::new(build_join_schema(&left_schema, &right_schema, &join_type).0);
 
@@ -114,9 +181,17 @@ impl SortMergeJoinExec {
             join_type,
             schema,
             metrics: ExecutionPlanMetricsSet::new(),
+            left_sort_exprs,
+            right_sort_exprs,
+            output_ordering,
             sort_options,
             null_equals_null,
         })
+    }
+
+    /// Set of common columns used to join on
+    pub fn on(&self) -> &[(Column, Column)] {
+        &self.on
     }
 }
 
@@ -129,23 +204,51 @@ impl ExecutionPlan for SortMergeJoinExec {
         self.schema.clone()
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        let (left_expr, right_expr) = self
+            .on
+            .iter()
+            .map(|(l, r)| {
+                (
+                    Arc::new(l.clone()) as Arc<dyn PhysicalExpr>,
+                    Arc::new(r.clone()) as Arc<dyn PhysicalExpr>,
+                )
+            })
+            .unzip();
+        vec![
+            Distribution::HashPartitioned(left_expr),
+            Distribution::HashPartitioned(right_expr),
+        ]
+    }
+
+    fn required_input_ordering(&self) -> Vec<Option<&[PhysicalSortExpr]>> {
+        vec![Some(&self.left_sort_exprs), Some(&self.right_sort_exprs)]
+    }
+
     fn output_partitioning(&self) -> Partitioning {
-        self.right.output_partitioning()
+        let left_columns_len = self.left.schema().fields.len();
+        partitioned_join_output_partitioning(
+            self.join_type,
+            self.left.output_partitioning(),
+            self.right.output_partitioning(),
+            left_columns_len,
+        )
     }
 
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        match self.join_type {
-            JoinType::Inner
-            | JoinType::Left
-            | JoinType::LeftSemi
-            | JoinType::LeftAnti => self.left.output_ordering(),
-            JoinType::Right | JoinType::RightSemi => self.right.output_ordering(),
-            JoinType::Full => None,
-        }
+        self.output_ordering.as_deref()
     }
 
-    fn relies_on_input_order(&self) -> bool {
-        true
+    fn equivalence_properties(&self) -> EquivalenceProperties {
+        let left_columns_len = self.left.schema().fields.len();
+        combine_join_equivalence_properties(
+            self.join_type,
+            self.left.equivalence_properties(),
+            self.right.equivalence_properties(),
+            left_columns_len,
+            self.on(),
+            self.schema(),
+        )
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -187,7 +290,7 @@ impl ExecutionPlan for SortMergeJoinExec {
                 self.on.iter().map(|on| on.0.clone()).collect(),
                 self.on.iter().map(|on| on.1.clone()).collect(),
             ),
-            JoinType::Right | JoinType::RightSemi => (
+            JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => (
                 self.right.clone(),
                 self.left.clone(),
                 self.on.iter().map(|on| on.1.clone()).collect(),
@@ -226,15 +329,23 @@ impl ExecutionPlan for SortMergeJoinExec {
             DisplayFormatType::Default => {
                 write!(
                     f,
-                    "SortMergeJoin: join_type={:?}, on={:?}, schema={:?}",
-                    self.join_type, self.on, &self.schema
+                    "SortMergeJoin: join_type={:?}, on={:?}",
+                    self.join_type, self.on
                 )
             }
         }
     }
 
     fn statistics(&self) -> Statistics {
-        todo!()
+        // TODO stats: it is not possible in general to know the output size of joins
+        // There are some special cases though, for example:
+        // - `A LEFT JOIN B ON A.col=B.col` with `COUNT_DISTINCT(B.col)=COUNT(B.col)`
+        estimate_join_statistics(
+            self.left.clone(),
+            self.right.clone(),
+            self.on.clone(),
+            &self.join_type,
+        )
     }
 }
 
@@ -463,7 +574,7 @@ impl RecordBatchStream for SMJStream {
 }
 
 impl Stream for SMJStream {
-    type Item = ArrowResult<RecordBatch>;
+    type Item = Result<RecordBatch>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -601,7 +712,7 @@ impl SMJStream {
     }
 
     /// Poll next streamed row
-    fn poll_streamed_row(&mut self, cx: &mut Context) -> Poll<Option<ArrowResult<()>>> {
+    fn poll_streamed_row(&mut self, cx: &mut Context) -> Poll<Option<Result<()>>> {
         loop {
             match &self.streamed_state {
                 StreamedState::Init => {
@@ -613,7 +724,6 @@ impl SMJStream {
                     } else {
                         self.streamed_state = StreamedState::Polling;
                     }
-                    continue;
                 }
                 StreamedState::Polling => match self.streamed.poll_next_unpin(cx)? {
                     Poll::Pending => {
@@ -644,10 +754,7 @@ impl SMJStream {
     }
 
     /// Poll next buffered batches
-    fn poll_buffered_batches(
-        &mut self,
-        cx: &mut Context,
-    ) -> Poll<Option<ArrowResult<()>>> {
+    fn poll_buffered_batches(&mut self, cx: &mut Context) -> Poll<Option<Result<()>>> {
         loop {
             match &self.buffered_state {
                 BufferedState::Init => {
@@ -745,7 +852,7 @@ impl SMJStream {
     }
 
     /// Get comparison result of streamed row and buffered batches
-    fn compare_streamed_buffered(&self) -> ArrowResult<Ordering> {
+    fn compare_streamed_buffered(&self) -> Result<Ordering> {
         if self.streamed_state == StreamedState::Exhausted {
             return Ok(Ordering::Greater);
         }
@@ -765,7 +872,7 @@ impl SMJStream {
 
     /// Produce join and fill output buffer until reaching target batch size
     /// or the join is finished
-    fn join_partial(&mut self) -> ArrowResult<()> {
+    fn join_partial(&mut self) -> Result<()> {
         let mut join_streamed = false;
         let mut join_buffered = false;
 
@@ -849,7 +956,7 @@ impl SMJStream {
         Ok(())
     }
 
-    fn freeze_all(&mut self) -> ArrowResult<()> {
+    fn freeze_all(&mut self) -> Result<()> {
         self.freeze_streamed()?;
         self.freeze_buffered(self.buffered_data.batches.len())?;
         Ok(())
@@ -859,7 +966,7 @@ impl SMJStream {
     // no longer needed:
     //   1. freezes all indices joined to streamed side
     //   2. freezes NULLs joined to dequeued buffered batch to "release" it
-    fn freeze_dequeuing_buffered(&mut self) -> ArrowResult<()> {
+    fn freeze_dequeuing_buffered(&mut self) -> Result<()> {
         self.freeze_streamed()?;
         self.freeze_buffered(1)?;
         Ok(())
@@ -869,7 +976,7 @@ impl SMJStream {
     // NULLs on streamed side.
     //
     // Applicable only in case of Full join.
-    fn freeze_buffered(&mut self, batch_count: usize) -> ArrowResult<()> {
+    fn freeze_buffered(&mut self, batch_count: usize) -> Result<()> {
         if !matches!(self.join_type, JoinType::Full) {
             return Ok(());
         }
@@ -887,7 +994,8 @@ impl SMJStream {
                 .columns()
                 .iter()
                 .map(|column| take(column, &buffered_indices, None))
-                .collect::<ArrowResult<Vec<_>>>()?;
+                .collect::<Result<Vec<_>, ArrowError>>()
+                .map_err(Into::<DataFusionError>::into)?;
 
             let mut streamed_columns = self
                 .streamed_schema
@@ -907,7 +1015,7 @@ impl SMJStream {
 
     // Produces and stages record batch for all output indices found
     // for current streamed batch and clears staged output indices.
-    fn freeze_streamed(&mut self) -> ArrowResult<()> {
+    fn freeze_streamed(&mut self) -> Result<()> {
         for chunk in self.streamed_batch.output_indices.iter_mut() {
             let streamed_indices = chunk.streamed_indices.finish();
 
@@ -921,7 +1029,7 @@ impl SMJStream {
                 .columns()
                 .iter()
                 .map(|column| take(column, &streamed_indices, None))
-                .collect::<ArrowResult<Vec<_>>>()?;
+                .collect::<Result<Vec<_>, ArrowError>>()?;
 
             let buffered_indices: UInt64Array = chunk.buffered_indices.finish();
 
@@ -934,7 +1042,7 @@ impl SMJStream {
                         .columns()
                         .iter()
                         .map(|column| take(column, &buffered_indices, None))
-                        .collect::<ArrowResult<Vec<_>>>()?
+                        .collect::<Result<Vec<_>, ArrowError>>()?
                 } else {
                     self.buffered_schema
                         .fields()
@@ -960,9 +1068,8 @@ impl SMJStream {
         Ok(())
     }
 
-    fn output_record_batch_and_reset(&mut self) -> ArrowResult<RecordBatch> {
-        let record_batch =
-            combine_batches(&self.output_record_batches, self.schema.clone())?.unwrap();
+    fn output_record_batch_and_reset(&mut self) -> Result<RecordBatch> {
+        let record_batch = concat_batches(&self.schema, &self.output_record_batches)?;
         self.join_metrics.output_batches.add(1);
         self.join_metrics.output_rows.add(record_batch.num_rows());
         self.output_size -= record_batch.num_rows();
@@ -1053,7 +1160,7 @@ fn compare_join_arrays(
     right: usize,
     sort_options: &[SortOptions],
     null_equals_null: bool,
-) -> ArrowResult<Ordering> {
+) -> Result<Ordering> {
     let mut res = Ordering::Equal;
     for ((left_array, right_array), sort_options) in
         left_arrays.iter().zip(right_arrays).zip(sort_options)
@@ -1121,7 +1228,7 @@ fn compare_join_arrays(
             DataType::Date32 => compare_value!(Date32Array),
             DataType::Date64 => compare_value!(Date64Array),
             _ => {
-                return Err(ArrowError::NotYetImplemented(
+                return Err(DataFusionError::NotImplemented(
                     "Unsupported data type in sort merge join comparator".to_owned(),
                 ));
             }
@@ -1140,7 +1247,7 @@ fn is_join_arrays_equal(
     left: usize,
     right_arrays: &[ArrayRef],
     right: usize,
-) -> ArrowResult<bool> {
+) -> Result<bool> {
     let mut is_equal = true;
     for (left_array, right_array) in left_arrays.iter().zip(right_arrays) {
         macro_rules! compare_value {
@@ -1187,7 +1294,7 @@ fn is_join_arrays_equal(
             DataType::Date32 => compare_value!(Date32Array),
             DataType::Date64 => compare_value!(Date64Array),
             _ => {
-                return Err(ArrowError::NotYetImplemented(
+                return Err(DataFusionError::NotImplemented(
                     "Unsupported data type in sort merge join comparator".to_owned(),
                 ));
             }

@@ -31,6 +31,25 @@ You can find a curated
 [good-first-issue](https://github.com/apache/arrow-datafusion/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
 list to help you get started.
 
+# Pull Requests
+
+We welcome pull requests (PRs) from anyone from the community.
+
+DataFusion is a very active fast-moving project and we try to review and merge PRs quickly to keep the review backlog down and the pace up. After review and approval, one of the [many people with commit access](https://arrow.apache.org/committers/) will merge your PR.
+
+Review bandwidth is currently our most limited resource, and we highly encourage reviews by the broader community. If you are waiting for your PR to be reviewed, consider helping review other PRs that are waiting. Such review both helps the reviewer to learn the codebase and become more expert, as well as helps identify issues in the PR (such as lack of test coverage), that can be addressed and make future reviews faster and more efficient.
+
+## Merging PRs
+
+Since we are a worldwide community, we have contributors in many timezones who review and comment. To ensure anyone who wishes has an opportunity to review a PR, our committers try to ensure that at least 24 hours passes between when a "major" PR is approved and when it is merged.
+
+A "major" PR means there is a substantial change in design or a change in the API. Committers apply their best judgment to determine what constitutes a substantial change. A "minor" PR might be merged without a 24 hour delay, again subject to the judgment of the committer. Examples of potential "minor" PRs are:
+
+1. Documentation improvements/additions
+2. Small bug fixes
+3. Non-controversial build-related changes (clippy, version upgrades etc.)
+4. Smaller non-controversial feature additions
+
 # Developer's guide
 
 This section describes how you can get started at developing DataFusion.
@@ -115,54 +134,12 @@ cargo test -p datafusion --tests sql_integration
 
 One very important test is the [sql_integration](../../../datafusion/core/tests/sql_integration.rs) test which validates DataFusion's ability to run a large assortment of SQL queries against an assortment of data setups.
 
-### SQL / Postgres Integration Tests
+### sqllogictests Tests
 
-The [integration-tests](../../../integration-tests) directory contains a harness that runs certain queries against both postgres and datafusion and compares results
+The [sqllogictests](../../../datafusion/core/tests/sqllogictests) also validate DataFusion SQL against an assortment of data setups.
 
-#### setup environment
-
-```shell
-export POSTGRES_DB=postgres
-export POSTGRES_USER=postgres
-export POSTGRES_HOST=localhost
-export POSTGRES_PORT=5432
-```
-
-#### Install dependencies
-
-```shell
-# Install dependencies
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r integration-tests/requirements.txt
-
-# setup environment
-POSTGRES_DB=postgres POSTGRES_USER=postgres POSTGRES_HOST=localhost POSTGRES_PORT=5432 python -m pytest -v integration-tests/test_psql_parity.py
-
-# Create
-psql -d "$POSTGRES_DB" -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -c 'CREATE TABLE IF NOT EXISTS test (
-  c1 character varying NOT NULL,
-  c2 integer NOT NULL,
-  c3 smallint NOT NULL,
-  c4 smallint NOT NULL,
-  c5 integer NOT NULL,
-  c6 bigint NOT NULL,
-  c7 smallint NOT NULL,
-  c8 integer NOT NULL,
-  c9 bigint NOT NULL,
-  c10 character varying NOT NULL,
-  c11 double precision NOT NULL,
-  c12 double precision NOT NULL,
-  c13 character varying NOT NULL
-);'
-
-psql -d "$POSTGRES_DB" -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -c "\copy test FROM '$(pwd)/testing/data/csv/aggregate_test_100.csv' WITH (FORMAT csv, HEADER true);"
-```
-
-#### Invoke the test runner
-
-```shell
-python -m pytest -v integration-tests/test_psql_parity.py
-```
+Data Driven tests have many benefits including being easier to write and maintain. We are in the process of [migrating sql_integration tests](https://github.com/apache/arrow-datafusion/issues/4460) and encourage
+you to add new tests using sqllogictests if possible.
 
 ## Benchmarks
 
@@ -259,7 +236,7 @@ can be displayed. For example, the following command creates a
 dot -Tpdf < /tmp/plan.dot > /tmp/plan.pdf
 ```
 
-## Specification
+## Specifications
 
 We formalize DataFusion semantics and behaviors through specification
 documents. These specifications are useful to be used as references to help

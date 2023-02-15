@@ -16,15 +16,16 @@
 // under the License.
 
 //! Serialization / Deserialization to Bytes
-use crate::logical_plan::{AsLogicalPlan, LogicalExtensionCodec};
-use crate::{from_proto::parse_expr, protobuf};
-use arrow::datatypes::SchemaRef;
-use datafusion::datasource::TableProvider;
+use crate::logical_plan::{
+    self, AsLogicalPlan, DefaultLogicalExtensionCodec, LogicalExtensionCodec,
+};
+use crate::physical_plan::{
+    AsExecutionPlan, DefaultPhysicalExtensionCodec, PhysicalExtensionCodec,
+};
+use crate::protobuf;
 use datafusion::physical_plan::functions::make_scalar_function;
 use datafusion_common::{DataFusionError, Result};
-use datafusion_expr::{
-    create_udaf, create_udf, Expr, Extension, LogicalPlan, Volatility,
-};
+use datafusion_expr::{create_udaf, create_udf, Expr, LogicalPlan, Volatility};
 use prost::{
     bytes::{Bytes, BytesMut},
     Message,
@@ -33,6 +34,7 @@ use std::sync::Arc;
 
 // Reexport Bytes which appears in the API
 use datafusion::execution::registry::FunctionRegistry;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 
 mod registry;
@@ -50,25 +52,30 @@ mod registry;
 /// // Convert it to an opaque form
 /// let bytes = expr.to_bytes().unwrap();
 ///
-/// // Decode bytes from somewhere (over network, etc.
+/// // Decode bytes from somewhere (over network, etc.)
 /// let decoded_expr = Expr::from_bytes(&bytes).unwrap();
 /// assert_eq!(expr, decoded_expr);
 /// ```
 pub trait Serializeable: Sized {
-    /// Convert `self` to an opaque byt stream
+    /// Convert `self` to an opaque byte stream
     fn to_bytes(&self) -> Result<Bytes>;
 
-    /// Convert `bytes` (the output of [`to_bytes`] back into an
+    /// Convert `bytes` (the output of [`to_bytes`]) back into an
     /// object. This will error if the serialized bytes contain any
     /// user defined functions, in which case use
     /// [`from_bytes_with_registry`]
+    ///
+    /// [`to_bytes`]: Self::to_bytes
+    /// [`from_bytes_with_registry`]: Self::from_bytes_with_registry
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
         Self::from_bytes_with_registry(bytes, &registry::NoRegistry {})
     }
 
-    /// Convert `bytes` (the output of [`to_bytes`] back into an
+    /// Convert `bytes` (the output of [`to_bytes`]) back into an
     /// object resolving user defined functions with the specified
     /// `registry`
+    ///
+    /// [`to_bytes`]: Self::to_bytes
     fn from_bytes_with_registry(
         bytes: &[u8],
         registry: &dyn FunctionRegistry,
@@ -79,11 +86,11 @@ impl Serializeable for Expr {
     fn to_bytes(&self) -> Result<Bytes> {
         let mut buffer = BytesMut::new();
         let protobuf: protobuf::LogicalExprNode = self.try_into().map_err(|e| {
-            DataFusionError::Plan(format!("Error encoding expr as protobuf: {}", e))
+            DataFusionError::Plan(format!("Error encoding expr as protobuf: {e}"))
         })?;
 
         protobuf.encode(&mut buffer).map_err(|e| {
-            DataFusionError::Plan(format!("Error encoding protobuf as bytes: {}", e))
+            DataFusionError::Plan(format!("Error encoding protobuf as bytes: {e}"))
         })?;
 
         let bytes: Bytes = buffer.into();
@@ -132,25 +139,25 @@ impl Serializeable for Expr {
         registry: &dyn FunctionRegistry,
     ) -> Result<Self> {
         let protobuf = protobuf::LogicalExprNode::decode(bytes).map_err(|e| {
-            DataFusionError::Plan(format!("Error decoding expr as protobuf: {}", e))
+            DataFusionError::Plan(format!("Error decoding expr as protobuf: {e}"))
         })?;
 
-        parse_expr(&protobuf, registry).map_err(|e| {
-            DataFusionError::Plan(format!("Error parsing protobuf into Expr: {}", e))
+        logical_plan::from_proto::parse_expr(&protobuf, registry).map_err(|e| {
+            DataFusionError::Plan(format!("Error parsing protobuf into Expr: {e}"))
         })
     }
 }
 
 /// Serialize a LogicalPlan as bytes
 pub fn logical_plan_to_bytes(plan: &LogicalPlan) -> Result<Bytes> {
-    let extension_codec = DefaultExtensionCodec {};
+    let extension_codec = DefaultLogicalExtensionCodec {};
     logical_plan_to_bytes_with_extension_codec(plan, &extension_codec)
 }
 
-/// Serialize a LogicalPlan as json
+/// Serialize a LogicalPlan as JSON
 #[cfg(feature = "json")]
 pub fn logical_plan_to_json(plan: &LogicalPlan) -> Result<String> {
-    let extension_codec = DefaultExtensionCodec {};
+    let extension_codec = DefaultLogicalExtensionCodec {};
     let protobuf =
         protobuf::LogicalPlanNode::try_from_logical_plan(plan, &extension_codec)
             .map_err(|e| {
@@ -169,17 +176,17 @@ pub fn logical_plan_to_bytes_with_extension_codec(
         protobuf::LogicalPlanNode::try_from_logical_plan(plan, extension_codec)?;
     let mut buffer = BytesMut::new();
     protobuf.encode(&mut buffer).map_err(|e| {
-        DataFusionError::Plan(format!("Error encoding protobuf as bytes: {}", e))
+        DataFusionError::Plan(format!("Error encoding protobuf as bytes: {e}"))
     })?;
     Ok(buffer.into())
 }
 
-/// Deserialize a LogicalPlan from json
+/// Deserialize a LogicalPlan from JSON
 #[cfg(feature = "json")]
 pub fn logical_plan_from_json(json: &str, ctx: &SessionContext) -> Result<LogicalPlan> {
     let back: protobuf::LogicalPlanNode = serde_json::from_str(json)
         .map_err(|e| DataFusionError::Plan(format!("Error serializing plan: {}", e)))?;
-    let extension_codec = DefaultExtensionCodec {};
+    let extension_codec = DefaultLogicalExtensionCodec {};
     back.try_into_logical_plan(ctx, &extension_codec)
 }
 
@@ -188,7 +195,7 @@ pub fn logical_plan_from_bytes(
     bytes: &[u8],
     ctx: &SessionContext,
 ) -> Result<LogicalPlan> {
-    let extension_codec = DefaultExtensionCodec {};
+    let extension_codec = DefaultLogicalExtensionCodec {};
     logical_plan_from_bytes_with_extension_codec(bytes, ctx, &extension_codec)
 }
 
@@ -199,52 +206,75 @@ pub fn logical_plan_from_bytes_with_extension_codec(
     extension_codec: &dyn LogicalExtensionCodec,
 ) -> Result<LogicalPlan> {
     let protobuf = protobuf::LogicalPlanNode::decode(bytes).map_err(|e| {
-        DataFusionError::Plan(format!("Error decoding expr as protobuf: {}", e))
+        DataFusionError::Plan(format!("Error decoding expr as protobuf: {e}"))
     })?;
     protobuf.try_into_logical_plan(ctx, extension_codec)
 }
 
-#[derive(Debug)]
-struct DefaultExtensionCodec {}
+/// Serialize a PhysicalPlan as bytes
+pub fn physical_plan_to_bytes(plan: Arc<dyn ExecutionPlan>) -> Result<Bytes> {
+    let extension_codec = DefaultPhysicalExtensionCodec {};
+    physical_plan_to_bytes_with_extension_codec(plan, &extension_codec)
+}
 
-impl LogicalExtensionCodec for DefaultExtensionCodec {
-    fn try_decode(
-        &self,
-        _buf: &[u8],
-        _inputs: &[LogicalPlan],
-        _ctx: &SessionContext,
-    ) -> Result<Extension> {
-        Err(DataFusionError::NotImplemented(
-            "No extension codec provided".to_string(),
-        ))
-    }
+/// Serialize a PhysicalPlan as JSON
+#[cfg(feature = "json")]
+pub fn physical_plan_to_json(plan: Arc<dyn ExecutionPlan>) -> Result<String> {
+    let extension_codec = DefaultPhysicalExtensionCodec {};
+    let protobuf =
+        protobuf::PhysicalPlanNode::try_from_physical_plan(plan, &extension_codec)
+            .map_err(|e| {
+                DataFusionError::Plan(format!("Error serializing plan: {}", e))
+            })?;
+    serde_json::to_string(&protobuf)
+        .map_err(|e| DataFusionError::Plan(format!("Error serializing plan: {}", e)))
+}
 
-    fn try_encode(&self, _node: &Extension, _buf: &mut Vec<u8>) -> Result<()> {
-        Err(DataFusionError::NotImplemented(
-            "No extension codec provided".to_string(),
-        ))
-    }
+/// Serialize a PhysicalPlan as bytes, using the provided extension codec
+pub fn physical_plan_to_bytes_with_extension_codec(
+    plan: Arc<dyn ExecutionPlan>,
+    extension_codec: &dyn PhysicalExtensionCodec,
+) -> Result<Bytes> {
+    let protobuf =
+        protobuf::PhysicalPlanNode::try_from_physical_plan(plan, extension_codec)?;
+    let mut buffer = BytesMut::new();
+    protobuf.encode(&mut buffer).map_err(|e| {
+        DataFusionError::Plan(format!("Error encoding protobuf as bytes: {e}"))
+    })?;
+    Ok(buffer.into())
+}
 
-    fn try_decode_table_provider(
-        &self,
-        _buf: &[u8],
-        _schema: SchemaRef,
-        _ctx: &SessionContext,
-    ) -> std::result::Result<Arc<dyn TableProvider>, DataFusionError> {
-        Err(DataFusionError::NotImplemented(
-            "No codec provided to for TableProviders".to_string(),
-        ))
-    }
+/// Deserialize a PhysicalPlan from JSON
+#[cfg(feature = "json")]
+pub fn physical_plan_from_json(
+    json: &str,
+    ctx: &SessionContext,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let back: protobuf::PhysicalPlanNode = serde_json::from_str(json)
+        .map_err(|e| DataFusionError::Plan(format!("Error serializing plan: {}", e)))?;
+    let extension_codec = DefaultPhysicalExtensionCodec {};
+    back.try_into_physical_plan(ctx, &ctx.runtime_env(), &extension_codec)
+}
 
-    fn try_encode_table_provider(
-        &self,
-        _node: Arc<dyn TableProvider>,
-        _buf: &mut Vec<u8>,
-    ) -> std::result::Result<(), DataFusionError> {
-        Err(DataFusionError::NotImplemented(
-            "No codec provided to for TableProviders".to_string(),
-        ))
-    }
+/// Deserialize a PhysicalPlan from bytes
+pub fn physical_plan_from_bytes(
+    bytes: &[u8],
+    ctx: &SessionContext,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let extension_codec = DefaultPhysicalExtensionCodec {};
+    physical_plan_from_bytes_with_extension_codec(bytes, ctx, &extension_codec)
+}
+
+/// Deserialize a PhysicalPlan from bytes
+pub fn physical_plan_from_bytes_with_extension_codec(
+    bytes: &[u8],
+    ctx: &SessionContext,
+    extension_codec: &dyn PhysicalExtensionCodec,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let protobuf = protobuf::PhysicalPlanNode::decode(bytes).map_err(|e| {
+        DataFusionError::Plan(format!("Error decoding expr as protobuf: {e}"))
+    })?;
+    protobuf.try_into_physical_plan(ctx, &ctx.runtime_env(), extension_codec)
 }
 
 #[cfg(test)]
@@ -321,6 +351,98 @@ mod test {
         Expr::from_bytes(&bytes).unwrap();
     }
 
+    fn roundtrip_expr(expr: &Expr) -> Expr {
+        let bytes = expr.to_bytes().unwrap();
+        Expr::from_bytes(&bytes).unwrap()
+    }
+
+    #[test]
+    fn exact_roundtrip_linearized_binary_expr() {
+        // (((A AND B) AND C) AND D)
+        let expr_ordered = col("A").and(col("B")).and(col("C")).and(col("D"));
+        assert_eq!(expr_ordered, roundtrip_expr(&expr_ordered));
+
+        // Ensure that no other variation becomes equal
+        let other_variants = vec![
+            // (((B AND A) AND C) AND D)
+            col("B").and(col("A")).and(col("C")).and(col("D")),
+            // (((A AND C) AND B) AND D)
+            col("A").and(col("C")).and(col("B")).and(col("D")),
+            // (((A AND B) AND D) AND C)
+            col("A").and(col("B")).and(col("D")).and(col("C")),
+            // A AND (B AND (C AND D)))
+            col("A").and(col("B").and(col("C").and(col("D")))),
+        ];
+        for case in other_variants {
+            // Each variant is still equal to itself
+            assert_eq!(case, roundtrip_expr(&case));
+
+            // But non of them is equal to the original
+            assert_ne!(expr_ordered, roundtrip_expr(&case));
+            assert_ne!(roundtrip_expr(&expr_ordered), roundtrip_expr(&case));
+        }
+    }
+
+    #[test]
+    fn roundtrip_deeply_nested_binary_expr() {
+        // We need more stack space so this doesn't overflow in dev builds
+        std::thread::Builder::new()
+            .stack_size(10_000_000)
+            .spawn(|| {
+                let n = 100;
+                // a < 5
+                let basic_expr = col("a").lt(lit(5i32));
+                // (a < 5) OR (a < 5) OR (a < 5) OR ...
+                let or_chain = (0..n)
+                    .fold(basic_expr.clone(), |expr, _| expr.or(basic_expr.clone()));
+                // (a < 5) OR (a < 5) AND (a < 5) OR (a < 5) AND (a < 5) AND (a < 5) OR ...
+                let expr =
+                    (0..n).fold(or_chain.clone(), |expr, _| expr.and(or_chain.clone()));
+
+                // Should work fine.
+                let bytes = expr.to_bytes().unwrap();
+
+                let decoded_expr = Expr::from_bytes(&bytes).expect(
+                    "serialization worked, so deserialization should work as well",
+                );
+                assert_eq!(decoded_expr, expr);
+            })
+            .expect("spawning thread")
+            .join()
+            .expect("joining thread");
+    }
+
+    #[test]
+    fn roundtrip_deeply_nested_binary_expr_reverse_order() {
+        // We need more stack space so this doesn't overflow in dev builds
+        std::thread::Builder::new()
+            .stack_size(10_000_000)
+            .spawn(|| {
+                let n = 100;
+
+                // a < 5
+                let expr_base = col("a").lt(lit(5i32));
+
+                // ((a < 5 AND a < 5) AND a < 5) AND ...
+                let and_chain =
+                    (0..n).fold(expr_base.clone(), |expr, _| expr.and(expr_base.clone()));
+
+                // a < 5 AND (a < 5 AND (a < 5 AND ...))
+                let expr = expr_base.and(and_chain);
+
+                // Should work fine.
+                let bytes = expr.to_bytes().unwrap();
+
+                let decoded_expr = Expr::from_bytes(&bytes).expect(
+                    "serialization worked, so deserialization should work as well",
+                );
+                assert_eq!(decoded_expr, expr);
+            })
+            .expect("spawning thread")
+            .join()
+            .expect("joining thread");
+    }
+
     #[test]
     fn roundtrip_deeply_nested() {
         // we need more stack space so this doesn't overflow in dev builds
@@ -332,7 +454,8 @@ mod test {
                 println!("testing: {n}");
 
                 let expr_base = col("a").lt(lit(5i32));
-                let expr = (0..n).fold(expr_base.clone(), |expr, _| expr.and(expr_base.clone()));
+                // Generate a tree of AND and OR expressions (no subsequent ANDs or ORs).
+                let expr = (0..n).fold(expr_base.clone(), |expr, n| if n % 2 == 0 { expr.and(expr_base.clone()) } else { expr.or(expr_base.clone()) });
 
                 // Convert it to an opaque form
                 let bytes = match expr.to_bytes() {
@@ -366,7 +489,7 @@ mod test {
             scalar_fn,
         );
 
-        let mut ctx = SessionContext::new();
+        let ctx = SessionContext::new();
         ctx.register_udf(udf);
 
         ctx

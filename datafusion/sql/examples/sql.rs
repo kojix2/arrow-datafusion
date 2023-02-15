@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::{
     logical_plan::builder::LogicalTableSource, AggregateUDF, ScalarUDF, TableSource,
@@ -52,10 +53,11 @@ fn main() {
     let plan = sql_to_rel.sql_statement_to_plan(statement.clone()).unwrap();
 
     // show the plan
-    println!("{:?}", plan);
+    println!("{plan:?}");
 }
 
 struct MySchemaProvider {
+    options: ConfigOptions,
     tables: HashMap<String, Arc<dyn TableSource>>,
 }
 
@@ -88,7 +90,10 @@ impl MySchemaProvider {
                 Field::new("price", DataType::Decimal128(10, 2), false),
             ]),
         );
-        Self { tables }
+        Self {
+            tables,
+            options: Default::default(),
+        }
     }
 }
 
@@ -119,5 +124,9 @@ impl ContextProvider for MySchemaProvider {
 
     fn get_variable_type(&self, _variable_names: &[String]) -> Option<DataType> {
         None
+    }
+
+    fn options(&self) -> &ConfigOptions {
+        &self.options
     }
 }

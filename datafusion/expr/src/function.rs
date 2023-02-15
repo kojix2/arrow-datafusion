@@ -85,8 +85,7 @@ fn utf8_or_binary_to_binary_type(arg_type: &DataType, name: &str) -> Result<Data
         _ => {
             // this error is internal as `data_types` should have captured this.
             return Err(DataFusionError::Internal(format!(
-                "The {:?} function can only accept strings or binary arrays.",
-                name
+                "The {name:?} function can only accept strings or binary arrays."
             )));
         }
     })
@@ -102,8 +101,7 @@ pub fn return_type(
 
     if input_expr_types.is_empty() && !fun.supports_zero_argument() {
         return Err(DataFusionError::Internal(format!(
-            "Builtin scalar function {} does not support empty arguments",
-            fun
+            "Builtin scalar function {fun} does not support empty arguments"
         )));
     }
 
@@ -133,7 +131,7 @@ pub fn return_type(
         }
         BuiltinScalarFunction::Concat => Ok(DataType::Utf8),
         BuiltinScalarFunction::ConcatWithSeparator => Ok(DataType::Utf8),
-        BuiltinScalarFunction::DatePart => Ok(DataType::Int32),
+        BuiltinScalarFunction::DatePart => Ok(DataType::Float64),
         BuiltinScalarFunction::DateTrunc => {
             Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
         }
@@ -157,6 +155,7 @@ pub fn return_type(
             utf8_to_int_type(&input_expr_types[0], "octet_length")
         }
         BuiltinScalarFunction::Random => Ok(DataType::Float64),
+        BuiltinScalarFunction::Uuid => Ok(DataType::Utf8),
         BuiltinScalarFunction::RegexpReplace => {
             utf8_to_str_type(&input_expr_types[0], "regex_replace")
         }
@@ -219,8 +218,10 @@ pub fn return_type(
         }
         BuiltinScalarFunction::Now => Ok(DataType::Timestamp(
             TimeUnit::Nanosecond,
-            Some("UTC".to_owned()),
+            Some("+00:00".to_owned()),
         )),
+        BuiltinScalarFunction::CurrentDate => Ok(DataType::Date32),
+        BuiltinScalarFunction::CurrentTime => Ok(DataType::Time64(TimeUnit::Nanosecond)),
         BuiltinScalarFunction::Translate => {
             utf8_to_str_type(&input_expr_types[0], "translate")
         }
@@ -254,6 +255,11 @@ pub fn return_type(
             _ => Ok(DataType::Float64),
         },
 
+        BuiltinScalarFunction::Log => match &input_expr_types[0] {
+            DataType::Float32 => Ok(DataType::Float32),
+            _ => Ok(DataType::Float64),
+        },
+
         BuiltinScalarFunction::ArrowTypeof => Ok(DataType::Utf8),
 
         BuiltinScalarFunction::Abs
@@ -264,7 +270,6 @@ pub fn return_type(
         | BuiltinScalarFunction::Cos
         | BuiltinScalarFunction::Exp
         | BuiltinScalarFunction::Floor
-        | BuiltinScalarFunction::Log
         | BuiltinScalarFunction::Ln
         | BuiltinScalarFunction::Log10
         | BuiltinScalarFunction::Log2
@@ -471,6 +476,10 @@ pub fn signature(fun: &BuiltinScalarFunction) -> Signature {
                     DataType::Utf8,
                     DataType::Timestamp(TimeUnit::Nanosecond, None),
                 ]),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".to_owned())),
+                ]),
             ],
             fun.volatility(),
         ),
@@ -578,6 +587,7 @@ pub fn signature(fun: &BuiltinScalarFunction) -> Signature {
             fun.volatility(),
         ),
         BuiltinScalarFunction::Random => Signature::exact(vec![], fun.volatility()),
+        BuiltinScalarFunction::Uuid => Signature::exact(vec![], fun.volatility()),
         BuiltinScalarFunction::Power => Signature::one_of(
             vec![
                 TypeSignature::Exact(vec![DataType::Int64, DataType::Int64]),
@@ -596,6 +606,15 @@ pub fn signature(fun: &BuiltinScalarFunction) -> Signature {
         ),
         BuiltinScalarFunction::Atan2 => Signature::one_of(
             vec![
+                TypeSignature::Exact(vec![DataType::Float32, DataType::Float32]),
+                TypeSignature::Exact(vec![DataType::Float64, DataType::Float64]),
+            ],
+            fun.volatility(),
+        ),
+        BuiltinScalarFunction::Log => Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Float32]),
+                TypeSignature::Exact(vec![DataType::Float64]),
                 TypeSignature::Exact(vec![DataType::Float32, DataType::Float32]),
                 TypeSignature::Exact(vec![DataType::Float64, DataType::Float64]),
             ],

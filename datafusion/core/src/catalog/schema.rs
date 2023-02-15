@@ -18,15 +18,16 @@
 //! Describes the interface and built-in implementations of schemas,
 //! representing collections of named tables.
 
-use parking_lot::RwLock;
+use async_trait::async_trait;
+use dashmap::DashMap;
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::datasource::TableProvider;
 use crate::error::{DataFusionError, Result};
 
 /// Represents a schema, comprising a number of named tables.
+#[async_trait]
 pub trait SchemaProvider: Sync + Send {
     /// Returns the schema provider as [`Any`](std::any::Any)
     /// so that it can be downcast to a specific implementation.
@@ -36,7 +37,7 @@ pub trait SchemaProvider: Sync + Send {
     fn table_names(&self) -> Vec<String>;
 
     /// Retrieves a specific table from the schema by name, provided it exists.
-    fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>>;
+    async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>>;
 
     /// If supported by the implementation, adds a new table to this schema.
     /// If a table of the same name existed before, it returns "Table already exists" error.
@@ -68,14 +69,14 @@ pub trait SchemaProvider: Sync + Send {
 
 /// Simple in-memory implementation of a schema.
 pub struct MemorySchemaProvider {
-    tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
+    tables: DashMap<String, Arc<dyn TableProvider>>,
 }
 
 impl MemorySchemaProvider {
     /// Instantiates a new MemorySchemaProvider with an empty collection of tables.
     pub fn new() -> Self {
         Self {
-            tables: RwLock::new(HashMap::new()),
+            tables: DashMap::new(),
         }
     }
 }
@@ -86,19 +87,21 @@ impl Default for MemorySchemaProvider {
     }
 }
 
+#[async_trait]
 impl SchemaProvider for MemorySchemaProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn table_names(&self) -> Vec<String> {
-        let tables = self.tables.read();
-        tables.keys().cloned().collect()
+        self.tables
+            .iter()
+            .map(|table| table.key().clone())
+            .collect()
     }
 
-    fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
-        let tables = self.tables.read();
-        tables.get(name).cloned()
+    async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+        self.tables.get(name).map(|table| table.value().clone())
     }
 
     fn register_table(
@@ -108,22 +111,18 @@ impl SchemaProvider for MemorySchemaProvider {
     ) -> Result<Option<Arc<dyn TableProvider>>> {
         if self.table_exist(name.as_str()) {
             return Err(DataFusionError::Execution(format!(
-                "The table {} already exists",
-                name
+                "The table {name} already exists"
             )));
         }
-        let mut tables = self.tables.write();
-        Ok(tables.insert(name, table))
+        Ok(self.tables.insert(name, table))
     }
 
     fn deregister_table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        let mut tables = self.tables.write();
-        Ok(tables.remove(name))
+        Ok(self.tables.remove(name).map(|(_, table)| table))
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        let tables = self.tables.read();
-        tables.contains_key(name)
+        self.tables.contains_key(name)
     }
 }
 
@@ -163,9 +162,9 @@ mod tests {
     async fn test_schema_register_listing_table() {
         let testdata = crate::test_util::parquet_test_data();
         let testdir = if testdata.starts_with('/') {
-            format!("file://{}", testdata)
+            format!("file://{testdata}")
         } else {
-            format!("file:///{}", testdata)
+            format!("file:///{testdata}")
         };
         let filename = if testdir.ends_with('/') {
             format!("{}{}", testdir, "alltypes_plain.parquet")

@@ -28,7 +28,7 @@ use crate::expressions::format_state_name;
 use crate::{AggregateExpr, PhysicalExpr};
 use datafusion_common::ScalarValue;
 use datafusion_common::{DataFusionError, Result};
-use datafusion_expr::{Accumulator, AggregateState};
+use datafusion_expr::Accumulator;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 struct DistinctScalarValues(Vec<ScalarValue>);
@@ -81,7 +81,7 @@ impl AggregateExpr for DistinctCount {
             .iter()
             .map(|state_data_type| {
                 Field::new(
-                    &format_state_name(&self.name, "count distinct"),
+                    format_state_name(&self.name, "count distinct"),
                     DataType::List(Box::new(Field::new(
                         "item",
                         state_data_type.clone(),
@@ -136,8 +136,7 @@ impl DistinctCountAccumulator {
             .map(|state| match state {
                 ScalarValue::List(Some(values), _) => Ok(values),
                 _ => Err(DataFusionError::Internal(format!(
-                    "Unexpected accumulator state {:?}",
-                    state
+                    "Unexpected accumulator state {state:?}"
                 ))),
             })
             .collect::<Result<Vec<_>>>()?;
@@ -177,13 +176,12 @@ impl Accumulator for DistinctCountAccumulator {
             self.merge(&v)
         })
     }
-    fn state(&self) -> Result<Vec<AggregateState>> {
+    fn state(&self) -> Result<Vec<ScalarValue>> {
         let mut cols_out = self
             .state_data_types
             .iter()
             .map(|state_data_type| {
-                let values = Box::new(Vec::new());
-                ScalarValue::new_list(Some(*values), state_data_type.clone())
+                ScalarValue::new_list(Some(Vec::new()), state_data_type.clone())
             })
             .collect::<Vec<_>>();
 
@@ -192,11 +190,9 @@ impl Accumulator for DistinctCountAccumulator {
             .map(|c| match c {
                 ScalarValue::List(Some(ref mut v), _) => Ok(v),
                 t => Err(DataFusionError::Internal(format!(
-                    "cols_out should only consist of ScalarValue::List. {:?} is found",
-                    t
+                    "cols_out should only consist of ScalarValue::List. {t:?} is found"
                 ))),
             })
-            .into_iter()
             .collect::<Result<Vec<_>>>()?;
 
         self.values.iter().for_each(|distinct_values| {
@@ -207,31 +203,49 @@ impl Accumulator for DistinctCountAccumulator {
             )
         });
 
-        Ok(cols_out.into_iter().map(AggregateState::Scalar).collect())
+        Ok(cols_out.into_iter().collect())
     }
 
     fn evaluate(&self) -> Result<ScalarValue> {
         match &self.count_data_type {
             DataType::Int64 => Ok(ScalarValue::Int64(Some(self.values.len() as i64))),
             t => Err(DataFusionError::Internal(format!(
-                "Invalid data type {:?} for count distinct aggregation",
-                t
+                "Invalid data type {t:?} for count distinct aggregation"
             ))),
         }
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self)
+            + (std::mem::size_of::<DistinctScalarValues>() * self.values.capacity())
+            + self
+                .values
+                .iter()
+                .map(|vals| {
+                    ScalarValue::size_of_vec(&vals.0) - std::mem::size_of_val(&vals.0)
+                })
+                .sum::<usize>()
+            + (std::mem::size_of::<DataType>() * self.state_data_types.capacity())
+            + self
+                .state_data_types
+                .iter()
+                .map(|dt| dt.size() - std::mem::size_of_val(dt))
+                .sum::<usize>()
+            + self.count_data_type.size()
+            - std::mem::size_of_val(&self.count_data_type)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aggregate::utils::get_accum_scalar_values;
     use arrow::array::{
         ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
-        Int64Array, Int8Array, ListArray, UInt16Array, UInt32Array, UInt64Array,
-        UInt8Array,
+        Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow::array::{Int32Builder, ListBuilder, UInt64Builder};
     use arrow::datatypes::DataType;
+    use datafusion_common::cast::as_list_array;
 
     macro_rules! state_to_vec {
         ($LIST:expr, $DATA_TYPE:ident, $PRIM_TY:ty) => {{
@@ -343,7 +357,7 @@ mod tests {
         let mut accum = agg.create_accumulator()?;
         accum.update_batch(arrays)?;
 
-        Ok((get_accum_scalar_values(accum.as_ref())?, accum.evaluate()?))
+        Ok((accum.state()?, accum.evaluate()?))
     }
 
     fn run_update(
@@ -374,14 +388,14 @@ mod tests {
 
         accum.update_batch(&arrays)?;
 
-        Ok((get_accum_scalar_values(accum.as_ref())?, accum.evaluate()?))
+        Ok((accum.state()?, accum.evaluate()?))
     }
 
     fn run_merge_batch(arrays: &[ArrayRef]) -> Result<(Vec<ScalarValue>, ScalarValue)> {
         let agg = DistinctCount::new(
             arrays
                 .iter()
-                .map(|a| a.as_any().downcast_ref::<ListArray>().unwrap())
+                .map(|a| as_list_array(a).unwrap())
                 .map(|a| a.values().data_type().clone())
                 .collect::<Vec<_>>(),
             vec![],
@@ -392,7 +406,7 @@ mod tests {
         let mut accum = agg.create_accumulator()?;
         accum.merge_batch(arrays)?;
 
-        Ok((get_accum_scalar_values(accum.as_ref())?, accum.evaluate()?))
+        Ok((accum.state()?, accum.evaluate()?))
     }
 
     // Used trait to create associated constant for f32 and f64
@@ -410,7 +424,6 @@ mod tests {
 
     macro_rules! test_count_distinct_update_batch_floating_point {
         ($ARRAY_TYPE:ident, $DATA_TYPE:ident, $PRIM_TYPE:ty) => {{
-            use ordered_float::OrderedFloat;
             let values: Vec<Option<$PRIM_TYPE>> = vec![
                 Some(<$PRIM_TYPE>::INFINITY),
                 Some(<$PRIM_TYPE>::NAN),
@@ -437,10 +450,10 @@ mod tests {
 
             let mut state_vec =
                 state_to_vec!(&states[0], $DATA_TYPE, $PRIM_TYPE).unwrap();
+
+            dbg!(&state_vec);
             state_vec.sort_by(|a, b| match (a, b) {
-                (Some(lhs), Some(rhs)) => {
-                    OrderedFloat::from(*lhs).cmp(&OrderedFloat::from(*rhs))
-                }
+                (Some(lhs), Some(rhs)) => lhs.total_cmp(rhs),
                 _ => a.partial_cmp(b).unwrap(),
             });
 
@@ -527,8 +540,7 @@ mod tests {
                     DataFusionError::Internal("Found None count".to_string())
                 }),
                 scalar => Err(DataFusionError::Internal(format!(
-                    "Found non int64 scalar value from count: {}",
-                    scalar
+                    "Found non int64 scalar value from count: {scalar}"
                 ))),
             }?;
             Ok((state_vec, count))
